@@ -537,7 +537,11 @@ class SecretFilter(logging.Filter):
 
 
 def btn(text, data, style='primary'):
-    return types.InlineKeyboardButton(text, callback_data=data, style=style)
+    # Button colors are Telegram client hints, not custom RGB colors.
+    try:
+        return types.InlineKeyboardButton(text, callback_data=data, style=style)
+    except TypeError:  # Older Bot API / library: keep the button usable without color.
+        return types.InlineKeyboardButton(text, callback_data=data)
 
 
 def keyboard(*rows):
@@ -564,6 +568,28 @@ class AIChat:
         self.bot.register_message_handler(self.command, commands=['start', 'menu', 'help', 'cancel', 'stop', 'new', 'backup', 'invite'])
         self.bot.register_callback_query_handler(self.callback, func=lambda call: True)
         self.bot.register_message_handler(self.message, content_types=['text', 'photo', 'document', 'voice', 'audio'])
+
+    @staticmethod
+    def model_label(model):
+        """Readable display name; keep the exact provider model ID for API calls."""
+        raw = (model or '').strip()
+        low = raw.casefold()
+        aliases = (
+            (('gpt-4o-mini',), 'GPT-4o mini'), (('gpt-4o',), 'GPT-4o'),
+            (('gpt-4.1-mini',), 'GPT-4.1 mini'), (('gpt-4.1-nano',), 'GPT-4.1 nano'),
+            (('gpt-4.1',), 'GPT-4.1'), (('gpt-3.5-turbo',), 'GPT-3.5 Turbo'),
+            (('claude-3-5-sonnet', 'claude-3.5-sonnet'), 'Claude 3.5 Sonnet'),
+            (('claude-3-7-sonnet', 'claude-3.7-sonnet'), 'Claude 3.7 Sonnet'),
+            (('claude-3-opus',), 'Claude 3 Opus'), (('claude-3-haiku',), 'Claude 3 Haiku'),
+            (('gemini-2.5-pro',), 'Gemini 2.5 Pro'), (('gemini-2.5-flash',), 'Gemini 2.5 Flash'),
+            (('gemini-2.0-flash',), 'Gemini 2.0 Flash'), (('deepseek-r1',), 'DeepSeek R1'),
+            (('deepseek-v3',), 'DeepSeek V3'), (('llama-3.3',), 'Llama 3.3'),
+            (('qwen2.5', 'qwen-2.5'), 'Qwen 2.5'),
+        )
+        for fragments, label in aliases:
+            if any(part in low for part in fragments):
+                return f'{label} · {raw}'
+        return raw
 
     def tell(self, uid, text, keys=None, title=None):
         if title:
@@ -620,25 +646,28 @@ class AIChat:
     def home(self, uid):
         self.states.pop(uid, None)
         p = self.store.panel(uid)
-        body = 'Добавь панель и выбери модель.'
+        body = 'Сначала добавь API-панель: «➕ Панель» → название → API URL → API-ключ.'
         if p:
             chat = self.store.chat(uid)
-            body = f"Панель · {p['name']}\nМодель · {chat['model'] or p['model'] or 'не выбрана'}\nЧат · {chat['title']}"
-        body += '\n\nПиши, отправляй фото или файл. Для нового разговора нажми «Новый чат».'
+            body = (f"🟢 Панель: {p['name']}\n"
+                    f"🧠 Модель: {self.model_label(chat['model'] or p['model'])}\n"
+                    f"💬 Чат: {chat['title']}")
+        body += '\n\nОтправляй сообщение, фото с подписью или документ. Для нового диалога нажми «Новый чат».'
         kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
         for row in (
             [('💬 Чаты', 'primary'), ('🧠 Модели', 'primary')],
-            [('📚 Панели', 'primary'), ('➕ Панель', 'success')],
-            [('📄 Документ', 'success'), ('🆕 Новый чат', 'primary')],
+            [('📚 Панели', 'primary'), ('➕ Добавить панель', 'success')],
+            [('📎 Файл', 'success'), ('🆕 Новый чат', 'primary')],
             [('💰 Расходы', 'primary'), ('⚙️ Настройки', 'primary')],
         ):
             kb.row(*(types.KeyboardButton(t, style=s) for t, s in row))
         if uid in self.admins:
-            kb.row(types.KeyboardButton('🛠 Админка', style='primary'))
-        self.bot.send_message(uid, '✨ AI Chat', reply_markup=kb)
-        self.card(uid, 'Твой AI-кабинет', body, keyboard(
-            [btn('⭐ Избранное', 'models:favorites'), btn('📚 Панели', 'panels')],
-            [btn('📄 Создать документ', 'formats', 'success')]))
+            kb.row(types.KeyboardButton('🛠 Админка · доступы', style='primary'))
+        self.bot.send_message(uid, '✨ AI CHAT  ·  личный кабинет', reply_markup=kb)
+        self.card(uid, 'Привет! 👋', body, keyboard(
+            [btn('🧠 Выбрать модель', 'models', 'success'), btn('📚 Мои панели', 'panels')],
+            [btn('⭐ Избранные модели', 'models:favorites')],
+            [btn('📎 Создать файл', 'formats')]))
 
     def panels(self, uid):
         panels = self.store.rows('SELECT * FROM panels WHERE owner=? ORDER BY id', (uid,))
@@ -663,10 +692,39 @@ class AIChat:
     def provider(self, panel):
         return Provider(panel, self.store.cipher)
 
+    @staticmethod
+    def model_label(model):
+        """Readable display name; retain the provider's exact model ID for API calls."""
+        raw = (model or '').strip()
+        low = raw.casefold()
+        aliases = (
+            (('gpt-4o-mini',), 'GPT-4o mini'),
+            (('gpt-4o',), 'GPT-4o'),
+            (('gpt-4.1-mini',), 'GPT-4.1 mini'),
+            (('gpt-4.1-nano',), 'GPT-4.1 nano'),
+            (('gpt-4.1',), 'GPT-4.1'),
+            (('gpt-3.5-turbo',), 'GPT-3.5 Turbo'),
+            (('claude-3-5-sonnet', 'claude-3.5-sonnet'), 'Claude 3.5 Sonnet'),
+            (('claude-3-7-sonnet', 'claude-3.7-sonnet'), 'Claude 3.7 Sonnet'),
+            (('claude-3-opus', 'claude-3.0-opus'), 'Claude 3 Opus'),
+            (('claude-3-haiku', 'claude-3.0-haiku'), 'Claude 3 Haiku'),
+            (('gemini-2.5-pro',), 'Gemini 2.5 Pro'),
+            (('gemini-2.5-flash',), 'Gemini 2.5 Flash'),
+            (('gemini-2.0-flash',), 'Gemini 2.0 Flash'),
+            (('deepseek-r1',), 'DeepSeek R1'),
+            (('deepseek-v3',), 'DeepSeek V3'),
+            (('llama-3.3',), 'Llama 3.3'),
+            (('qwen2.5', 'qwen-2.5'), 'Qwen 2.5'),
+        )
+        for fragments, label in aliases:
+            if any(part in low for part in fragments):
+                return f'{label} · {raw}'
+        return raw
+
     def models(self, uid, page=0, query='', favorites=False, refresh=False):
         p = self.store.panel(uid)
         if not p:
-            raise ValueError('Сначала добавь панель.')
+            raise ValueError('Сначала добавь панель кнопкой «➕ Добавить панель».')
         cached = self.cache.get(uid)
         if refresh or not cached or cached['panel'] != p['id'] or cached['expires'] < now():
             cached = {'panel': p['id'], 'all': self.provider(p).models(), 'expires': now() + 1800}
@@ -682,18 +740,25 @@ class AIChat:
         buttons = []
         for index in range(page * 7, min(len(available), (page + 1) * 7)):
             model = available[index]
-            buttons.append([btn(('✓ ' if model == current else '') + model[:45], f'model:{cached["revision"]}:{index}', 'success' if model == current else 'primary'),
-                            btn('★' if model in favs else '☆', f'favorite:{cached["revision"]}:{index}', 'success' if model in favs else 'primary')])
+            label = self.model_label(model)
+            buttons.append([btn(('✅ ' if model == current else '🤖 ') + label[:55],
+                                f'model:{cached["revision"]}:{index}',
+                                'success' if model == current else 'primary'),
+                            btn('⭐' if model in favs else '☆', f'favorite:{cached["revision"]}:{index}',
+                                'success' if model in favs else 'primary')])
         nav = []
         if page:
-            nav.append(btn('‹', f'modelpage:{page - 1}'))
-        nav.append(btn(f'{page + 1}/{total}', 'noop'))
+            nav.append(btn('⬅️ Назад', f'modelpage:{page - 1}'))
+        nav.append(btn(f'Страница {page + 1}/{total}', 'noop'))
         if page + 1 < total:
-            nav.append(btn('›', f'modelpage:{page + 1}'))
-        buttons += [nav, [btn('🔎 Поиск', 'searchmodel'), btn('⭐ Избранное', 'models:favorites'), btn('Все', 'models')],
-                    [btn('↻ Обновить', 'refreshmodels'), btn('🏠 Кабинет', 'home')]]
-        self.card(uid, '🧠 Модели · ' + p['name'],
-                  f'Найдено: {len(available)}\nНажми название для выбора, ☆ для избранного.\nСмена модели создаёт новый чат.', keyboard(*buttons))
+            nav.append(btn('Вперёд ➡️', f'modelpage:{page + 1}'))
+        buttons += [nav, [btn('🔎 Найти', 'searchmodel'), btn('⭐ Избранное', 'models:favorites', 'success'), btn('📋 Все', 'models')],
+                    [btn('🔄 Обновить', 'refreshmodels'), btn('🏠 Кабинет', 'home')]]
+        if not available:
+            description = 'По этому запросу моделей нет. Нажми «📋 Все» или обнови список.'
+        else:
+            description = f'Найдено: {len(available)}\nНажми кнопку модели, чтобы выбрать её. ⭐ сохраняет модель в избранное.\nТекущий выбор: {self.model_label(current) if current else "не выбран"}.'
+        self.card(uid, '🧠 Выбор модели · ' + p['name'], description, keyboard(*buttons))
 
     def chats(self, uid, page=0):
         all_chats = self.store.rows('SELECT c.*,p.name AS panel_name FROM chats c JOIN panels p ON p.id=c.panel WHERE c.owner=? ORDER BY c.updated DESC', (uid,))
@@ -1028,9 +1093,13 @@ class AIChat:
         if uid not in self.admins:
             raise ValueError('Этот раздел доступен администратору.')
         users = self.store.one('SELECT COUNT(*) AS n FROM users')['n']
-        self.card(uid, '🛠 Админка', f'Пользователей: {users}\nДоступ: ' + ('по приглашениям' if self.cfg['invite_only'] else 'открытая регистрация'), keyboard(
-            [btn('📤 Экспорт БД', 'backup'), btn('📥 Импорт БД', 'restore')],
-            [btn('🔗 Приглашение', 'invite', 'success'), btn('🏠 Кабинет', 'home')]))
+        self.card(uid, '🛠 Админка · доступы и база',
+                  f'Пользователей: {users}\nРежим: ' + ('только по приглашению' if self.cfg['invite_only'] else 'регистрация открыта') +
+                  '\n\nЧтобы добавить человека: нажми «🔗 Создать приглашение» и перешли ему ссылку. Он открывает её в Telegram и задаёт свой пароль. Ссылка одноразовая и действует 24 часа.',
+                  keyboard(
+                      [btn('🔗 Создать приглашение', 'invite', 'success')],
+                      [btn('📤 Экспорт БД', 'backup'), btn('📥 Импорт БД', 'restore')],
+                      [btn('🏠 В кабинет', 'home')]))
 
     def invite(self, uid):
         if uid not in self.admins:
@@ -1038,7 +1107,7 @@ class AIChat:
         code = secrets.token_urlsafe(18)
         self.store.write('INSERT INTO invites VALUES(?,?,?)', (code, 1, now() + 86400))
         name = self.bot.get_me().username
-        self.tell(uid, f'🔗 Одноразовое приглашение, действует 24 часа:\nhttps://t.me/{name}?start=invite_{code}')
+        self.tell(uid, f'🔗 Ссылка готова — перешли её человеку, которого хочешь добавить. Она работает один раз и истекает через 24 часа.\n\nhttps://t.me/{name}?start=invite_{code}')
 
     def admit(self, uid, code):
         if uid in self.admins or self.store.user(uid):
