@@ -56,32 +56,47 @@ AI-Chat/
 
 ## 🚀 Быстрый старт
 
-Нужен **Python 3.10 или новее**.
+Нужен **Python 3.10 или новее**. На Ubuntu 22.04 подойдёт штатный Python 3.10.
+
+### Ubuntu / VPS
+
+Скопируй блок целиком. Он скачает проект в `/opt/ai-chat`, создаст виртуальное окружение и установит зависимости:
 
 ```bash
-python -m venv .venv
+sudo apt update
+sudo apt install -y git python3 python3-venv fonts-dejavu-core
+sudo git clone https://github.com/wseinsshop-alt/AI-Chat.git /opt/ai-chat
+sudo chown -R "$USER":"$USER" /opt/ai-chat
+cd /opt/ai-chat
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python main.py --setup
+.venv/bin/python main.py
 ```
 
-Активируй окружение:
+Во время `--setup` введи токен от **@BotFather** и свой **числовой Telegram ID**. Токен вводится скрыто и сохраняется вне репозитория. Последняя команда запускает бота в текущей SSH-сессии; для постоянной работы после выхода настрой [systemd](#-круглосуточная-работа).
 
-```bash
-# Linux / macOS
-source .venv/bin/activate
-```
+### Windows
+
+Скачай ZIP репозитория и распакуй его, либо клонируй через Git. В PowerShell из папки проекта:
 
 ```powershell
-# Windows PowerShell — можно вызывать Python без активации
+py -3 -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 .venv\Scripts\python.exe main.py --setup
 .venv\Scripts\python.exe main.py
 ```
 
-На Linux в активированном окружении:
+### macOS / Linux
+
+В папке проекта:
 
 ```bash
-python -m pip install -r requirements.txt
-python main.py --setup
-python main.py
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python main.py --setup
+.venv/bin/python main.py
 ```
 
 Для русскоязычных PDF на Ubuntu/Debian:
