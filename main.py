@@ -545,11 +545,8 @@ class SecretFilter(logging.Filter):
 
 
 def btn(text, data, style='primary'):
-    # Button colors are Telegram client hints, not custom RGB colors.
-    try:
-        return types.InlineKeyboardButton(text, callback_data=data, style=style)
-    except TypeError:  # Older Bot API / library: keep the button usable without color.
-        return types.InlineKeyboardButton(text, callback_data=data)
+    # Keep a consistent appearance; Telegram clients choose button colors themselves.
+    return types.InlineKeyboardButton(text, callback_data=data)
 
 
 def keyboard(*rows):
@@ -711,9 +708,9 @@ class AIChat:
             [('📎 Файл', 'success'), ('🆕 Новый чат', 'primary')],
             [('💰 Расходы', 'primary'), ('⚙️ Настройки', 'primary')],
         ):
-            kb.row(*(types.KeyboardButton(t, style=s) for t, s in row))
+            kb.row(*(types.KeyboardButton(t) for t, s in row))
         if uid in self.admins:
-            kb.row(types.KeyboardButton('🛠 Админка · доступы', style='primary'))
+            kb.row(types.KeyboardButton('🛠 Админка · доступы'))
         self.bot.send_message(uid, '✨ AI CHAT  ·  личный кабинет', reply_markup=kb)
         self.card(uid, 'Привет! 👋', body, keyboard(
             [btn('🧠 Выбрать модель', 'models', 'success'), btn('📚 Мои панели', 'panels')],
@@ -1507,8 +1504,20 @@ class AIChat:
                 raise ValueError('Закончи текущую настройку или /cancel, затем пришли вложение ещё раз.')
             self.launch(uid, lambda job: self.attachment(uid, job, message))
             return
-        nav = {'💬 Чаты': 'chats', '🧠 Модели': 'models', '📚 Панели': 'panels', '➕ Панель': 'addpanel',
-               '📄 Документ': 'formats', '🆕 Новый чат': 'newchat', '💰 Расходы': 'usage', '⚙️ Настройки': 'settings', '🛠 Админка': 'admin'}
+        nav = {
+            '💬 Чаты': 'chats',
+            '🧠 Модели': 'models',
+            '📚 Панели': 'panels',
+            '➕ Добавить панель': 'addpanel',
+            '➕ Панель': 'addpanel',  # Older reply keyboard label.
+            '📎 Файл': 'formats',
+            '📄 Документ': 'formats',  # Older reply keyboard label.
+            '🆕 Новый чат': 'newchat',
+            '💰 Расходы': 'usage',
+            '⚙️ Настройки': 'settings',
+            '🛠 Админка · доступы': 'admin',
+            '🛠 Админка': 'admin',  # Older reply keyboard label.
+        }
         if text in nav:
             self.states.pop(uid, None)
             # Use the same authorization-aware routing as inline buttons.
