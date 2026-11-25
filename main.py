@@ -300,6 +300,14 @@ class Store:
                 c.executemany(f"INSERT INTO {table} ({','.join(fields)}) VALUES ({','.join('?' for _ in fields)})", [[row.get(k) for k in fields] for row in payload[table]])
             c.execute('UPDATE users SET verified=0,failures=0,locked=0')
 
+    def clear_database(self):
+        """Make a forced encrypted backup, then remove user data but retain the DB schema."""
+        self.automatic_backup(force=True)
+        with self.db() as c:
+            c.execute('DELETE FROM reservations')
+            for table in reversed(self.TABLES):
+                c.execute('DELETE FROM ' + table)
+
     def automatic_backup(self, hours=24, keep=7, force=False):
         folder = self.data / 'backups'
         folder.mkdir(exist_ok=True)
@@ -570,6 +578,27 @@ class AIChat:
         self.bot.register_message_handler(self.message, content_types=['text', 'photo', 'document', 'voice', 'audio'])
 
     @staticmethod
+    def model_label(model):
+        """Readable model label; keep the exact provider model ID for API calls."""
+        raw = (model or '').strip()
+        low = raw.casefold()
+        aliases = (
+            (('gpt-4o-mini',), 'GPT-4o mini'), (('gpt-4o',), 'GPT-4o'),
+            (('gpt-4.1-mini',), 'GPT-4.1 mini'), (('gpt-4.1-nano',), 'GPT-4.1 nano'),
+            (('gpt-4.1',), 'GPT-4.1'), (('gpt-3.5-turbo',), 'GPT-3.5 Turbo'),
+            (('claude-3-5-sonnet', 'claude-3.5-sonnet'), 'Claude 3.5 Sonnet'),
+            (('claude-3-7-sonnet', 'claude-3.7-sonnet'), 'Claude 3.7 Sonnet'),
+            (('claude-3-opus',), 'Claude 3 Opus'), (('claude-3-haiku',), 'Claude 3 Haiku'),
+            (('gemini-2.5-pro',), 'Gemini 2.5 Pro'), (('gemini-2.5-flash',), 'Gemini 2.5 Flash'),
+            (('gemini-2.0-flash',), 'Gemini 2.0 Flash'), (('deepseek-r1',), 'DeepSeek R1'),
+            (('deepseek-v3',), 'DeepSeek V3'), (('llama-3.3',), 'Llama 3.3'),
+            (('qwen2.5', 'qwen-2.5'), 'Qwen 2.5'),
+        )
+        for fragments, label in aliases:
+            if any(part in low for part in fragments):
+                return f'{label} · {raw}'
+        return raw
+
     def model_label(model):
         """Readable display name; keep the exact provider model ID for API calls."""
         raw = (model or '').strip()
@@ -1121,6 +1150,7 @@ class AIChat:
                   keyboard(
                       [btn('🔗 Создать приглашение', 'invite', 'success')],
                       [btn('📤 Экспорт БД', 'backup'), btn('📥 Импорт БД', 'restore')],
+                      [btn('🗑 Очистить базу', 'cleardb', 'danger')],
                       [btn('🏠 В кабинет', 'home')]))
 
     def invite(self, uid):
@@ -1361,6 +1391,24 @@ class AIChat:
                         raise ValueError('Перед импортом дождись завершения всех запросов.')
                     self.states[uid] = {'step': 'import_password'}
                     self.tell(uid, 'Подтверди свой пароль для импорта всей базы.')
+                elif action == 'cleardb':
+                    if uid not in self.admins:
+                        raise ValueError('Нужны права администратора.')
+                    if self.jobs:
+                        raise ValueError('Перед очисткой дождись завершения запросов.')
+                    self.states[uid] = {'step': 'clear_password', 'expires': now() + 300}
+                    self.tell(uid, '⚠️ Очистить пользователей, панели, чаты, приглашения и статистику? Перед очисткой сохранится зашифрованная копия. Подтверди личным паролем в течение 5 минут.')
+                elif action == 'confirmcleardb':
+                    state = self.states.get(uid, {})
+                    if uid not in self.admins or state.get('step') != 'clear_confirm' or state.get('expires', 0) < now():
+                        raise ValueError('Подтверждение очистки истекло. База не изменена.')
+                    with self.lock:
+                        if self.jobs:
+                            raise ValueError('Сначала дождись завершения всех запросов.')
+                        self.store.clear_database()
+                        self.states.clear()
+                        self.cache.clear()
+                    self.tell(uid, 'База очищена. Создана зашифрованная копия в каталоге backups. /start — начать настройку заново.')
                 elif action == 'confirmrestore':
                     state = self.states.get(uid, {})
                     if uid not in self.admins or state.get('step') != 'import_confirm' or state.get('expires', 0) < now():
@@ -1397,13 +1445,13 @@ class AIChat:
         state = self.states.get(uid, {})
         step = state.get('step')
         u = self.store.user(uid)
-        auth_steps = ('register', 'register_confirm', 'login', 'old_password', 'new_password', 'new_password_confirm', 'import_password')
+        auth_steps = ('register', 'register_confirm', 'login', 'old_password', 'new_password', 'new_password_confirm', 'import_password', 'clear_password')
         if step in auth_steps and message.content_type == 'text':
             self.erase(message)
             if step not in ('register', 'register_confirm', 'login') and not self.authenticated(uid):
                 self.gate(uid)
                 return
-            if step in ('login', 'old_password', 'import_password'):
+            if step in ('login', 'old_password', 'import_password', 'clear_password'):
                 self.verify_password(uid, text)
                 if step == 'old_password':
                     self.states[uid] = {'step': 'new_password'}
@@ -1413,6 +1461,15 @@ class AIChat:
                         raise ValueError('Нужны права администратора.')
                     self.states[uid] = {'step': 'import_file', 'expires': now() + 300}
                     self.tell(uid, 'Пришли .enc-копию в течение 5 минут. Нужен тот же secret.key.')
+                elif step == 'clear_password':
+                    if uid not in self.admins:
+                        raise ValueError('Нужны права администратора.')
+                    self.states[uid] = {'step': 'clear_confirm', 'expires': now() + 300}
+                    self.card(uid, 'Последнее подтверждение',
+                              'Это удалит данные всех пользователей, панели, историю, приглашения и статистику. Перед этим будет сделана зашифрованная копия. Продолжить?',
+                              keyboard([btn('🗑 Да, очистить всё', 'confirmcleardb', 'danger'),
+                                        btn('↩️ Отмена', 'admin')]))
+                    return
                 else:
                     self.store.write('UPDATE users SET verified=? WHERE id=?', (now(), uid))
                     self.home(uid)
