@@ -591,6 +591,28 @@ class AIChat:
                 return f'{label} · {raw}'
         return raw
 
+    @staticmethod
+    def model_label(model):
+        """Readable model label; API requests still use the provider ID."""
+        raw = (model or '').strip()
+        low = raw.casefold()
+        aliases = (
+            (('gpt-4o-mini',), 'GPT-4o mini'), (('gpt-4o',), 'GPT-4o'),
+            (('gpt-4.1-mini',), 'GPT-4.1 mini'), (('gpt-4.1-nano',), 'GPT-4.1 nano'),
+            (('gpt-4.1',), 'GPT-4.1'), (('gpt-3.5-turbo',), 'GPT-3.5 Turbo'),
+            (('claude-3-5-sonnet', 'claude-3.5-sonnet'), 'Claude 3.5 Sonnet'),
+            (('claude-3-7-sonnet', 'claude-3.7-sonnet'), 'Claude 3.7 Sonnet'),
+            (('claude-3-opus',), 'Claude 3 Opus'), (('claude-3-haiku',), 'Claude 3 Haiku'),
+            (('gemini-2.5-pro',), 'Gemini 2.5 Pro'), (('gemini-2.5-flash',), 'Gemini 2.5 Flash'),
+            (('gemini-2.0-flash',), 'Gemini 2.0 Flash'), (('deepseek-r1',), 'DeepSeek R1'),
+            (('deepseek-v3',), 'DeepSeek V3'), (('llama-3.3',), 'Llama 3.3'),
+            (('qwen2.5', 'qwen-2.5'), 'Qwen 2.5'),
+        )
+        for fragments, label in aliases:
+            if any(part in low for part in fragments):
+                return f'{label} · {raw}'
+        return raw
+
     def tell(self, uid, text, keys=None, title=None):
         if title:
             text = '<b>' + html.escape(title) + '</b>\n\n' + html.escape(text)
