@@ -545,8 +545,10 @@ class SecretFilter(logging.Filter):
 
 
 def btn(text, data, style='primary'):
-    # Keep a consistent appearance; Telegram clients choose button colors themselves.
-    return types.InlineKeyboardButton(text, callback_data=data)
+    # Telegram supports semantic button styles, not arbitrary RGB colors.
+    if style not in ('primary', 'success', 'danger'):
+        style = 'primary'
+    return types.InlineKeyboardButton(text, callback_data=data, style=style)
 
 
 def keyboard(*rows):
@@ -714,8 +716,7 @@ class AIChat:
         self.bot.send_message(uid, '✨ AI CHAT  ·  личный кабинет', reply_markup=kb)
         self.card(uid, 'Привет! 👋', body, keyboard(
             [btn('🧠 Выбрать модель', 'models', 'success'), btn('📚 Мои панели', 'panels')],
-            [btn('⭐ Избранные модели', 'models:favorites')],
-            [btn('📎 Создать файл', 'formats')]))
+            [btn('⭐ Избранные модели', 'models:favorites'), btn('📎 Создать файл', 'formats')]))
 
     def panels(self, uid):
         panels = self.store.rows('SELECT * FROM panels WHERE owner=? ORDER BY id', (uid,))
@@ -800,8 +801,10 @@ class AIChat:
         nav.append(btn(f'Страница {page + 1}/{total}', 'noop'))
         if page + 1 < total:
             nav.append(btn('Вперёд ➡️', f'modelpage:{page + 1}'))
-        buttons += [nav, [btn('🔎 Найти', 'searchmodel'), btn('⭐ Избранное', 'models:favorites', 'success'), btn('📋 Все', 'models')],
-                    [btn('🔄 Обновить', 'refreshmodels'), btn('🏠 Кабинет', 'home')]]
+        buttons += [nav,
+                    [btn('🔎 Найти', 'searchmodel'), btn('📋 Все модели', 'models')],
+                    [btn('⭐ Избранное', 'models:favorites', 'success'), btn('🔄 Обновить', 'refreshmodels')],
+                    [btn('🏠 В кабинет', 'home')]]
         if not available:
             description = 'По этому запросу моделей нет. Нажми «📋 Все» или обнови список.'
         else:
