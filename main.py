@@ -703,20 +703,17 @@ class AIChat:
                     f"🧠 Модель: {self.model_label(chat['model'] or p['model'])}\n"
                     f"💬 Чат: {chat['title']}")
         body += '\n\nОтправляй сообщение, фото с подписью или документ. Для нового диалога нажми «Новый чат».'
-        kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-        for row in (
-            [('💬 Чаты', 'primary'), ('🧠 Модели', 'primary')],
-            [('📚 Панели', 'primary'), ('➕ Добавить панель', 'success')],
-            [('📎 Файл', 'success'), ('🆕 Новый чат', 'primary')],
-            [('💰 Расходы', 'primary'), ('⚙️ Настройки', 'primary')],
-        ):
-            kb.row(*(types.KeyboardButton(t) for t, s in row))
+        self.bot.send_message(uid, '✨ AI CHAT  ·  личный кабинет',
+                              reply_markup=types.ReplyKeyboardRemove())
+        rows = [
+            [btn('🧠 Модели', 'models', 'success'), btn('📚 Панели', 'panels')],
+            [btn('💬 Чаты', 'chats'), btn('🆕 Новый чат', 'newchat', 'success')],
+            [btn('⭐ Избранное', 'models:favorites', 'success'), btn('📎 Создать файл', 'formats')],
+            [btn('💰 Расходы', 'usage'), btn('⚙️ Настройки', 'settings')],
+        ]
         if uid in self.admins:
-            kb.row(types.KeyboardButton('🛠 Админка · доступы'))
-        self.bot.send_message(uid, '✨ AI CHAT  ·  личный кабинет', reply_markup=kb)
-        self.card(uid, 'Привет! 👋', body, keyboard(
-            [btn('🧠 Выбрать модель', 'models', 'success'), btn('📚 Мои панели', 'panels')],
-            [btn('⭐ Избранные модели', 'models:favorites'), btn('📎 Создать файл', 'formats')]))
+            rows.append([btn('🛠 Админка · доступы', 'admin')])
+        self.card(uid, 'Привет! 👋', body, keyboard(*rows))
 
     def panels(self, uid):
         panels = self.store.rows('SELECT * FROM panels WHERE owner=? ORDER BY id', (uid,))
