@@ -153,6 +153,8 @@ CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT,
 CREATE TABLE IF NOT EXISTS favorites(owner INTEGER,panel INTEGER REFERENCES panels(id) ON DELETE CASCADE,
  model TEXT,PRIMARY KEY(owner,panel,model));
 CREATE TABLE IF NOT EXISTS invites(code TEXT PRIMARY KEY,uses INTEGER NOT NULL,expires REAL NOT NULL,days INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS panel_shares(panel INTEGER NOT NULL REFERENCES panels(id) ON DELETE CASCADE,
+ friend INTEGER NOT NULL,PRIMARY KEY(panel,friend));
 CREATE TABLE IF NOT EXISTS admitted(id INTEGER PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS subscriptions(id INTEGER PRIMARY KEY,expires REAL NOT NULL DEFAULT 0,
  blocked INTEGER NOT NULL DEFAULT 0);
@@ -163,7 +165,7 @@ CREATE TABLE IF NOT EXISTS reservations(id TEXT PRIMARY KEY,owner INTEGER,day TE
 
 
 class Store:
-    TABLES = ('users', 'panels', 'chats', 'messages', 'favorites', 'invites', 'admitted', 'subscriptions', 'usage')
+    TABLES = ('users', 'panels', 'chats', 'messages', 'favorites', 'invites', 'admitted', 'subscriptions', 'usage', 'panel_shares')
 
     def __init__(self, data: Path):
         self.data = data
@@ -256,7 +258,14 @@ class Store:
         if pid is None:
             u = self.user(uid)
             pid = u['active'] if u else None
-        return self.one('SELECT * FROM panels WHERE owner=? AND id=?', (uid, pid))
+        p = self.one('SELECT * FROM panels WHERE id=?', (pid,))
+        if p and (p['owner'] == uid or (self.has_subscription(uid) and self.one(
+                'SELECT 1 FROM panel_shares WHERE panel=? AND friend=?', (pid, uid)))):
+            return p
+        return None
+
+    def available_panels(self, uid):
+        return [p for p in self.rows('SELECT * FROM panels ORDER BY id') if self.panel(uid, p['id'])]
 
     def chat(self, uid):
         panel = self.panel(uid)
@@ -296,7 +305,7 @@ class Store:
     def backup(self):
         with self.db() as c:
             c.execute('BEGIN')
-            payload = {'version': 3, 'created': now()}
+            payload = {'version': 4, 'created': now()}
             for table in self.TABLES:
                 payload[table] = [dict(r) for r in c.execute('SELECT * FROM ' + table)]
         return self.cipher.encrypt(json.dumps(payload, ensure_ascii=False).encode())
@@ -309,8 +318,11 @@ class Store:
             for invite in payload.get('invites', []):
                 invite.setdefault('days', 0)
             payload['version'] = 3
-        if payload.get('version') != 3 or not all(isinstance(payload.get(t), list) for t in self.TABLES):
-            raise ValueError('Нужна резервная копия AI Chat версии 2/3 и исходный secret.key.')
+        if payload.get('version') == 3:
+            payload['panel_shares'] = []
+            payload['version'] = 4
+        if payload.get('version') != 4 or not all(isinstance(payload.get(t), list) for t in self.TABLES):
+            raise ValueError('Нужна резервная копия AI Chat версии 2/3/4 и исходный secret.key.')
         for panel in payload['panels']:
             normalize_url(panel['url'])
             self.cipher.decrypt(panel['token'].encode())
@@ -704,7 +716,7 @@ class AIChat:
 
     def subscription_info(self, uid):
         self.card(uid, '🎟 Мой доступ', self.subscription_label(uid) +
-                  f'\nТвой Telegram ID: {uid}\n\nАдминистратор выдаёт и продлевает доступ. Панели, API-ключи и расходы у каждого свои.',
+                  f'\nТвой Telegram ID: {uid}\n\nАдминистратор выдаёт и продлевает доступ. Администратор может открыть свои панели. Чаты у каждого личные; общая панель расходует API-баланс владельца.',
                   keyboard([btn('🏠 Кабинет', 'home')]))
 
     def verify_password(self, uid, text):
@@ -720,7 +732,7 @@ class AIChat:
     def home(self, uid):
         self.states.pop(uid, None)
         p = self.store.panel(uid)
-        body = 'Сначала добавь API-панель: «➕ Панель» → название → API URL → API-ключ.'
+        body = 'Открой «Панели»: там появятся панели, выданные администратором. Также можно добавить свою панель.'
         if p:
             chat = self.store.chat(uid)
             body = (f"🟢 Панель: {p['name']}\n"
@@ -742,13 +754,13 @@ class AIChat:
         self.card(uid, 'Привет! 👋', body, keyboard(*rows))
 
     def panels(self, uid):
-        panels = self.store.rows('SELECT * FROM panels WHERE owner=? ORDER BY id', (uid,))
+        panels = self.store.available_panels(uid)
         current = self.store.panel(uid)
         buttons = []
         for p in panels:
             selected = current and current['id'] == p['id']
             buttons.append([btn(('✓ ' if selected else '') + p['name'][:38], f'panel:{p["id"]}', 'success' if selected else 'primary'),
-                            btn('⚙️', f'panelcfg:{p["id"]}')])
+                            btn('⚙️' if p['owner'] == uid else '🤝', f'panelcfg:{p["id"]}')])
         buttons += [[btn('➕ Добавить', 'addpanel', 'success')], [btn('🏠 Кабинет', 'home')]]
         self.card(uid, '📚 Твои панели', 'Выбери панель или открой её настройки.', keyboard(*buttons))
 
@@ -756,12 +768,20 @@ class AIChat:
         p = self.store.panel(uid, pid)
         if not p:
             raise ValueError('Панель не найдена.')
+        if p['owner'] != uid:
+            self.card(uid, '🤝 ' + p['name'], 'Общая панель администратора. Чаты личные. API-ключ скрыт; запросы расходуют баланс владельца.',
+                      keyboard([btn('🧠 Модели', 'models'), btn('‹ Панели', 'panels')]))
+            return
         self.card(uid, '⚙️ ' + p['name'], p['url'] + '\nПотоковый ответ: ' + ('включён' if p['stream'] else 'выключен'), keyboard(
             [btn('✏️ Название', f'renamepanel:{pid}'), btn('🔑 API-ключ', f'rekey:{pid}')],
             [btn('🔎 Проверить API', f'check:{pid}'), btn('↔️ Режим ответа', f'stream:{pid}')],
             [btn('🗑 Удалить', f'delpanel:{pid}', 'danger'), btn('‹ Панели', 'panels')]))
 
-    def provider(self, panel):
+    def provider(self, panel, uid=None):
+        if uid is not None:
+            panel = self.store.panel(uid, panel['id'])
+            if not panel:
+                raise ValueError('Доступ к панели отозван.')
         return Provider(panel, self.store.cipher)
 
 
@@ -808,6 +828,7 @@ class AIChat:
 
     def chats(self, uid, page=0):
         all_chats = self.store.rows('SELECT c.*,p.name AS panel_name FROM chats c JOIN panels p ON p.id=c.panel WHERE c.owner=? ORDER BY c.updated DESC', (uid,))
+        all_chats = [c for c in all_chats if self.store.panel(uid, c['panel'])]
         total = max(1, math.ceil(len(all_chats) / 8))
         page = max(0, min(page, total - 1))
         buttons = [[btn(c['title'][:35] + ' · ' + c['panel_name'][:15], f'chat:{c["id"]}'), btn('⚙️', f'chatcfg:{c["id"]}')]
@@ -824,6 +845,8 @@ class AIChat:
         chat = self.store.one('SELECT * FROM chats WHERE id=? AND owner=?', (cid, uid))
         if not chat:
             raise ValueError('Чат не найден.')
+        if not self.store.panel(uid, chat['panel']):
+            raise ValueError('Доступ к панели отозван.')
         return chat
 
     def settings(self, uid):
@@ -922,6 +945,8 @@ class AIChat:
     def generation(self, uid, job, content, cid=None, fmt=None, retry=False):
         chat = self.owned_chat(uid, cid) if cid else self.store.chat(uid)
         panel = self.store.panel(uid, chat['panel'])
+        if not panel:
+            raise ValueError('Доступ к панели отозван.')
         model = chat['model'] or panel['model']
         if not model:
             raise ValueError('Сначала выбери модель.')
@@ -970,7 +995,7 @@ class AIChat:
             if panel['stream']:
                 payload['stream_options'] = {'include_usage': True}
             request_started = True
-            response = self.provider(panel).request('/chat/completions', payload, stream=bool(panel['stream']))
+            response = self.provider(panel, uid).request('/chat/completions', payload, stream=bool(panel['stream']))
             job.response = response
             if panel['stream']:
                 last_edit = now()
@@ -1078,7 +1103,7 @@ class AIChat:
                 raise Cancelled()
             started = True
             name = getattr(obj, 'file_name', None) or 'voice.ogg'
-            response = self.provider(panel).request('/audio/transcriptions', {'model': model},
+            response = self.provider(panel, uid).request('/audio/transcriptions', {'model': model},
                                                    files={'file': (name, raw, getattr(obj, 'mime_type', None) or 'audio/ogg')})
             job.response = response
             result = json.loads(bounded_response(response, 1024 * 1024))
@@ -1115,7 +1140,7 @@ class AIChat:
             if job.cancel.is_set():
                 raise Cancelled()
             started = True
-            response = self.provider(panel).request('/audio/speech',
+            response = self.provider(panel, uid).request('/audio/speech',
                 {'model': model, 'voice': self.cfg['speech_voice'], 'input': text, 'response_format': 'mp3'})
             job.response = response
             audio = bounded_response(response, 15 * 1024 * 1024)
@@ -1179,7 +1204,31 @@ class AIChat:
                   '\n\nСрок продлевается от текущего окончания. Бессрочный доступ сохраняется при продлении. Чтобы заменить его сроком, сначала отключи доступ.',
                   keyboard([btn('+7 дней', f'grant:{friend}:7', 'success'), btn('+30 дней', f'grant:{friend}:30', 'success')],
                            [btn('+90 дней', f'grant:{friend}:90', 'success'), btn('Без срока', f'grant:{friend}:0', 'success')],
+                           [btn('🤝 Выдать панели', f'shares:{friend}', 'primary')],
                            [btn('⛔ Отключить', f'revokefriend:{friend}', 'danger'), btn('👥 К друзьям', 'friends')]))
+
+    def share_menu(self, uid, friend, page=0):
+        if uid not in self.admins or friend <= 0 or friend in self.admins:
+            raise ValueError('Нужны права администратора и ID друга.')
+        panels = self.store.rows('SELECT * FROM panels WHERE owner=? ORDER BY id', (uid,))
+        pages = max(1, math.ceil(len(panels) / 8))
+        page = max(0, min(page, pages - 1))
+        rows = []
+        for p in panels[page * 8:page * 8 + 8]:
+            granted = self.store.one('SELECT 1 FROM panel_shares WHERE panel=? AND friend=?', (p['id'], friend))
+            rows.append([btn(('✅ ' if granted else '➕ ') + p['name'][:38],
+                             f'sharetoggle:{friend}:{p["id"]}:{page}', 'success' if granted else 'primary')])
+        nav = []
+        if page:
+            nav.append(btn('← Назад', f'shares:{friend}:{page-1}'))
+        if page + 1 < pages:
+            nav.append(btn('Далее →', f'shares:{friend}:{page+1}'))
+        if nav:
+            rows.append(nav)
+        rows.append([btn('‹ Друг', f'friend:{friend}')])
+        self.card(uid, f'🤝 Панели для {friend} · {page+1}/{pages}',
+                  '✅ — доступ включён. Нажми панель, чтобы выдать или отозвать доступ. Друг видит все модели выбранной панели, но только свои чаты. Запросы расходуют твой API-баланс. Сначала выдай подписку в карточке друга.',
+                  keyboard(*rows))
 
     def invite(self, uid, days=None):
         if uid not in self.admins:
@@ -1308,6 +1357,8 @@ class AIChat:
                     panel = self.store.panel(uid, pid)
                     if not panel:
                         raise ValueError('Панель не найдена.')
+                    if panel['owner'] != uid:
+                        raise ValueError('Изменять общую панель может только её владелец.')
                     if action in ('renamepanel', 'rekey'):
                         self.states[uid] = {'step': action, 'panel': pid}
                         self.tell(uid, 'Введи новое название.' if action == 'renamepanel' else 'Пришли новый API-ключ. Старый ключ сохранится, если проверка не пройдёт.')
@@ -1355,7 +1406,8 @@ class AIChat:
                         self.models(uid, query=cache.get('query', ''), favorites=cache.get('favorites', False))
                     else:
                         self.store.write('UPDATE panels SET model=? WHERE owner=? AND id=?', (model, uid, p['id']))
-                        self.store.new_chat(uid)
+                        chat = self.store.new_chat(uid)
+                        self.store.write('UPDATE chats SET model=? WHERE id=? AND owner=?', (model, chat['id'], uid))
                         self.home(uid)
                 elif action in ('chats', 'chatpage'):
                     self.chats(uid, int(parts[1]) if action == 'chatpage' else 0)
@@ -1437,6 +1489,33 @@ class AIChat:
                     self.tell(uid, 'Отправь числовой Telegram ID друга. Он увидит свой ID в «🎟 Мой доступ». /cancel — отмена.')
                 elif action == 'friend':
                     self.friend_card(uid, int(parts[1]))
+                elif action in ('shares', 'sharetoggle'):
+                    if uid not in self.admins:
+                        raise ValueError('Нужны права администратора.')
+                    friend = int(parts[1])
+                    if friend <= 0 or friend in self.admins:
+                        raise ValueError('Укажи ID друга.')
+                    page = int(parts[-1]) if len(parts) > 2 else 0
+                    if action == 'sharetoggle':
+                        pid = int(parts[2])
+                        p = self.store.one('SELECT * FROM panels WHERE id=? AND owner=?', (pid, uid))
+                        if not p:
+                            raise ValueError('Выдавать можно только собственные панели.')
+                        with self.store.db() as c:
+                            exists = c.execute('SELECT 1 FROM panel_shares WHERE panel=? AND friend=?', (pid, friend)).fetchone()
+                            if exists:
+                                c.execute('DELETE FROM panel_shares WHERE panel=? AND friend=?', (pid, friend))
+                                c.execute('UPDATE users SET active=NULL,current_chat=NULL WHERE id=? AND active=?', (friend, pid))
+                            else:
+                                c.execute('INSERT INTO panel_shares VALUES(?,?)', (pid, friend))
+                                c.execute('UPDATE users SET active=?,current_chat=NULL WHERE id=? AND active IS NULL', (pid, friend))
+                        if exists:
+                            with self.lock:
+                                job = self.jobs.get(friend)
+                                if job:
+                                    job.cancel.set()
+                        self.cache.pop(friend, None)
+                    self.share_menu(uid, friend, page)
                 elif action == 'grant':
                     if uid not in self.admins:
                         raise ValueError('Нужны права администратора.')
@@ -1648,8 +1727,8 @@ class AIChat:
             self.models(uid)
         elif step in ('renamepanel', 'rekey'):
             panel = self.store.panel(uid, state['panel'])
-            if not panel:
-                raise ValueError('Панель не найдена.')
+            if not panel or panel['owner'] != uid:
+                raise ValueError('Панель не найдена или нет прав на изменение.')
             if step == 'renamepanel':
                 if not text.strip() or len(text) > 60:
                     raise ValueError('Название: 1–60 символов.')
