@@ -53,9 +53,8 @@ FORMATS = ('pdf', 'docx', 'xlsx', 'txt', 'md', 'csv')
 DEFAULTS = {'invite_only': True, 'session_hours': 24, 'backup_hours': 24,
             'backup_keep': 7, 'daily_tokens': 100000, 'daily_usd': 0,
             'max_output_tokens': 4096, 'history_messages': 20, 'max_file_mb': 10,
-            'workers': 4, 'prices': {}, 'transcription_model': 'whisper-1',
-            'speech_model': 'tts-1', 'speech_voice': 'alloy',
-            'transcription_usd_per_minute': None, 'speech_usd_per_million_characters': None,
+            'workers': 4, 'prices': {}, 'image_prices': {}, 'image_model': '', 'transcription_model': 'whisper-1',
+            'transcription_usd_per_minute': None,
             'system_prompt': 'Ты полезный помощник в Telegram. Не выдумывай выполненные действия.'}
 
 
@@ -398,7 +397,7 @@ class Provider:
         self.url = panel['url']
         self.key = cipher.decrypt(panel['token'].encode()).decode()
 
-    def request(self, path, payload=None, files=None, stream=False):
+    def request(self, path, payload=None, files=None, stream=False, read_timeout=60):
         address = public_host(self.url)
         parsed = urlsplit(self.url)
         session = requests.Session()
@@ -408,7 +407,7 @@ class Provider:
             response = session.request('GET' if payload is None and files is None else 'POST', self.url + path,
                                        headers={'Authorization': 'Bearer ' + self.key, 'Host': parsed.netloc},
                                        json=payload if files is None else None, data=payload if files else None,
-                                       files=files, stream=True, timeout=(15, 60), allow_redirects=False)
+                                       files=files, stream=True, timeout=(15, read_timeout), allow_redirects=False)
             if response.status_code != 200:
                 response.close()
                 raise ValueError(f'API: HTTP {response.status_code}. Проверь base URL, ключ, модель, поддержку функции и баланс.')
@@ -436,9 +435,11 @@ class Provider:
         return result
 
 
-def bounded_response(response, limit):
+def bounded_response(response, limit, cancel=None):
     result = bytearray()
     for chunk in response.iter_content(65536):
+        if cancel is not None and cancel.is_set():
+            raise Cancelled()
         result.extend(chunk)
         if len(result) > limit:
             raise ValueError('Ответ сервера превышает лимит размера.')
@@ -455,6 +456,109 @@ def image_content(raw, caption):
         image.save(out, 'JPEG', quality=82)
     return [{'type': 'text', 'text': caption or 'Что на изображении? Помоги разобраться.'},
             {'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,' + base64.b64encode(out.getvalue()).decode()}}]
+
+
+
+def output_parts(message):
+    """Normalize text and image fields used by OpenAI-compatible chat panels."""
+    text, images = [], []
+    def image(value):
+        if isinstance(value, dict):
+            if value.get('b64_json'):
+                images.append('data:image/png;base64,' + value['b64_json'])
+                return
+            value = value.get('image_url', value.get('url', ''))
+        if isinstance(value, dict):
+            value = value.get('url', '')
+        if isinstance(value, str) and value:
+            images.append(value)
+    content = message.get('content', '')
+    if isinstance(content, str):
+        text.append(content)
+    elif isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get('type') in ('text', 'output_text'):
+                value = item.get('text', '')
+                if isinstance(value, str):
+                    text.append(value)
+            elif item.get('type') in ('image', 'image_url', 'output_image'):
+                image(item)
+    for item in message.get('images', []) or []:
+        image(item)
+    return ''.join(text), images
+
+
+def picture_bytes(value, cancel):
+    """Download a bounded image from a public HTTPS URL, never with panel credentials."""
+    limit = 15 * 1024 * 1024
+    if cancel.is_set():
+        raise Cancelled()
+    if value.startswith('data:image/'):
+        if len(value) > limit * 4 // 3 + 256 or ';base64,' not in value:
+            raise ValueError('Изображение слишком большое или имеет неверный формат.')
+        try:
+            return base64.b64decode(value.split(',', 1)[1], validate=True)
+        except Exception:
+            raise ValueError('Модель вернула некорректное изображение.') from None
+    parsed = urlsplit(value)
+    if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
+        raise ValueError('Изображение должно быть доступно по публичному HTTPS.')
+    # Validate DNS without rejecting signed CDN query parameters.
+    base = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, '', ''))
+    address = public_host(base)
+    session = requests.Session()
+    session.trust_env = False
+    session.mount('https://', PinnedHTTPSAdapter(parsed.hostname, address, parsed.port or 443))
+    response = None
+    try:
+        response = session.get(value, headers={'Host': parsed.netloc}, stream=True,
+                               timeout=(15, 60), allow_redirects=False)
+        if response.status_code != 200:
+            raise ValueError('Не удалось скачать изображение от модели.')
+        return bounded_response(response, limit, cancel)
+    finally:
+        if response is not None:
+            response.close()
+        session.close()
+
+
+def photo_buffer(raw):
+    """Send a Telegram-friendly preview; decode only bounded raster images."""
+    with Image.open(io.BytesIO(raw)) as source:
+        if source.width * source.height > 24000000 or source.width < 1 or source.height < 1:
+            raise ValueError('Лимит изображения — 24 мегапикселя.')
+        source.seek(0)
+        image = ImageOps.exif_transpose(source).convert('RGBA')
+        image.thumbnail((2048, 2048))
+        canvas = Image.new('RGB', image.size, 'white')
+        canvas.paste(image, mask=image.getchannel('A'))
+        # Telegram rejects extremely narrow photographs.
+        if max(canvas.size) > min(canvas.size) * 20:
+            square = Image.new('RGB', (max(canvas.size), max(canvas.size)), 'white')
+            square.paste(canvas, ((square.width-canvas.width)//2, (square.height-canvas.height)//2))
+            canvas = square
+        out = io.BytesIO()
+        canvas.save(out, 'JPEG', quality=90)
+    out.seek(0)
+    out.name = 'AI-Chat.jpg'
+    return out
+
+
+def requested_output(text):
+    """Explicit output requests only; ordinary questions stay in the text chat."""
+    image = re.match(r'(?is)^\s*(?:нарисуй(?:те)?|изобрази(?:те)?|draw\b|'
+                     r'(?:создай|сгенерируй|сделай)\s+(?:мне\s+)?(?:картинку|изображение|фото|иллюстрацию)|'
+                     r'(?:create|generate)\s+(?:an?\s+)?image\b)', text)
+    if image:
+        return 'image'
+    document = re.search(r'(?i)(?:сделай|создай|подготовь|пришли|сохрани|оформи|отправь|'
+                         r'create|send|save).{0,100}\b(pdf|пдф|docx|ворд|xlsx|эксель|txt|csv|markdown)\b', text)
+    if document:
+        return {'пдф': 'pdf', 'ворд': 'docx', 'эксель': 'xlsx', 'markdown': 'md'}.get(
+            document.group(1).lower(), document.group(1).lower())
+    return None
 
 
 def check_zip(raw):
@@ -644,7 +748,7 @@ class AIChat:
         self.menu_lock = threading.RLock()
         self.pool = ThreadPoolExecutor(max_workers=config['workers'])
         self.closed = threading.Event()
-        self.bot.register_message_handler(self.command, commands=['start', 'menu', 'help', 'cancel', 'stop', 'new', 'models', 'panels', 'chats', 'backup', 'invite', 'subscription'])
+        self.bot.register_message_handler(self.command, commands=['start', 'menu', 'help', 'cancel', 'stop', 'new', 'models', 'panels', 'chats', 'image', 'backup', 'invite', 'subscription'])
         self.bot.register_callback_query_handler(self.callback, func=lambda call: True)
         self.bot.register_message_handler(self.message, content_types=['text', 'photo', 'document', 'voice', 'audio'])
 
@@ -799,11 +903,12 @@ class AIChat:
             [btn('💬 Продолжить', 'resume'), btn('✚ Новый чат', 'newchat')],
             [btn('🧠 Модели', 'models'), btn('📚 Панели', 'panels')],
             [btn('🗂 Мои чаты', 'chats'), btn('⭐ Избранное', 'models:favorites')],
-            [btn('📄 Документы', 'formats'), btn('💰 Расходы', 'usage')],
-            [btn('⚙️ Настройки', 'settings'), btn('🎟 Мой доступ', 'subscription')],
-            [btn('❔ Помощь', 'help'), btn('🛠 Админка' if uid in self.admins else '🔄 Обновить',
-                                         'admin' if uid in self.admins else 'home')],
+            [btn('📄 Документы', 'formats'), btn('🖼 Нарисовать', 'imageprompt')],
+            [btn('💰 Расходы', 'usage'), btn('⚙️ Настройки', 'settings')],
+            [btn('🎟 Мой доступ', 'subscription'), btn('❔ Помощь', 'help')],
         ]
+        if uid in self.admins:
+            rows.append([btn('🛠 Админка', 'admin'), btn('🔄 Обновить', 'home')])
         self.card(uid, 'AI CHAT · Главное меню', body, keyboard(*rows))
 
     def resume(self, uid):
@@ -826,7 +931,7 @@ class AIChat:
 
     def help_menu(self, uid):
         self.card(uid, '❔ Как пользоваться',
-                  'ОБЩЕНИЕ\nВыбери панель и модель, затем просто пиши. Для фотографии добавь вопрос в подпись. Можно прислать PDF, DOCX, XLSX, TXT, MD, CSV или JSON.\n\nДОКУМЕНТЫ\nОткрой «Документы», выбери формат и опиши, что создать.\n\nУПРАВЛЕНИЕ\n/menu — меню · /new — новый чат\n/stop — остановить · /cancel — отменить настройку\n\nВыданные панели используют баланс владельца, история чатов у каждого своя. Поддержка фото и голоса зависит от модели и панели.',
+                  'ОБЩЕНИЕ\nВыбери панель и модель, затем просто пиши. Для фотографии добавь вопрос в подпись. Можно прислать PDF, DOCX, XLSX, TXT, MD, CSV или JSON.\n\nДОКУМЕНТЫ\nОткрой «Документы», выбери формат и опиши, что создать.\n\nУПРАВЛЕНИЕ\n/menu — меню · /new — новый чат\n/stop — остановить · /cancel — отменить настройку\n\nВыданные панели используют баланс владельца, история чатов у каждого своя. Голосовые распознаются, ответ приходит текстом. «Нарисуй…» создаёт картинку через модель изображений. Поддержка фото, голоса и картинок зависит от API-панели.',
                   keyboard([btn('💬 К общению', 'resume'), btn('📄 Документы', 'formats')],
                            [btn('📚 Панели', 'panels'), btn('🏠 Меню', 'home')]))
 
@@ -1029,6 +1134,118 @@ class AIChat:
             raise ValueError('В этом чате ещё нет ответа ИИ.')
         return json.loads(row['content'])
 
+
+    def route_input(self, uid, job, text):
+        if not text.strip() or len(text) > 20000:
+            raise ValueError('Отправь сообщение до 20 000 символов.')
+        self.prepare_panel(uid)
+        output = requested_output(text)
+        if output == 'image':
+            self.generate_image(uid, job, text)
+        elif output:
+            self.generation(uid, job, text, fmt=output)
+        else:
+            self.generation(uid, job, text)
+
+    def image_prompt(self, uid):
+        p = self.prepare_panel(uid)
+        if not p:
+            self.panels(uid)
+            return
+        chat = self.store.chat(uid)
+        model = chat['model'] or self.store.preferred_model(uid, p)
+        self.states[uid] = {'step': 'image_prompt'}
+        self.card(uid, '🖼 Нарисовать изображение',
+                  f"Панель: {p['name']}\nМодель: {self.model_label(model) if model else 'не выбрана'}\n\n"
+                  'Напиши, что нарисовать. Можно просто отправить «Нарисуй…» или /image с описанием.\n\n'
+                  'Для рисования бот найдёт модель изображений в этой панели. Можно выбрать её вручную через «Модели». Поддержка рисования зависит от панели.',
+                  keyboard([btn('🧠 Сменить модель', 'models'), btn('↩ Отмена', 'home')]))
+
+    def send_pictures(self, uid, job, references, as_file=False):
+        unique = list(dict.fromkeys(references))
+        if len(unique) > 4:
+            raise ValueError('За один ответ можно получить не более четырёх изображений.')
+        for reference in unique:
+            raw = picture_bytes(reference, job.cancel)
+            photo = photo_buffer(raw)  # Validate format and dimensions even when sending a file.
+            if job.cancel.is_set():
+                raise Cancelled()
+            if as_file:
+                with Image.open(io.BytesIO(raw)) as source:
+                    ext = {'JPEG': 'jpg', 'PNG': 'png', 'WEBP': 'webp', 'GIF': 'gif'}.get(source.format)
+                if not ext:
+                    raise ValueError('Для отправки файлом нужны PNG, JPEG, WEBP или GIF.')
+                original = io.BytesIO(raw)
+                original.name = 'AI-Chat.' + ext
+                self.bot.send_document(uid, original, caption='🖼 Изображение от ИИ · оригинал')
+            else:
+                self.bot.send_photo(uid, photo, caption='🖼 Изображение от ИИ')
+
+    def generate_image(self, uid, job, prompt):
+        if not prompt.strip() or len(prompt) > 20000:
+            raise ValueError('Описание картинки должно содержать от 1 до 20 000 символов.')
+        self.prepare_panel(uid)
+        chat = self.store.chat(uid)
+        panel = self.store.panel(uid, chat['panel'])
+        if not panel:
+            raise ValueError('Доступ к панели отозван.')
+        model = chat['model'] or self.store.preferred_model(uid, panel)
+        self.require_subscription(uid)
+        configured = self.cfg.get('image_model', '')
+        is_image = lambda name: bool(re.search(r'(?i)(gpt-image|dall-e|flux|imagen|ideogram|seedream|recraft|sdxl|stable.diffusion)', name))
+        if configured:
+            model = configured
+        elif not model or not is_image(model):
+            available = self.provider(panel, uid).models()
+            candidates = sorted(name for name in available if is_image(name))
+            if not candidates:
+                raise ValueError('В панели не найдена модель для картинок. Выбери модель изображений в «Модели» или попроси владельца подключить её.')
+            model = candidates[0]
+        rates = self.cfg.get('image_prices', {})
+        cost = rates.get(panel['url'] + '|' + model, rates.get(model)) if isinstance(rates, dict) else None
+        if cost is not None:
+            cost = float(cost)
+            if not math.isfinite(cost) or cost < 0:
+                raise ValueError('Некорректная цена изображения в image_prices.')
+        estimate = len(prompt.encode()) + int(self.cfg['max_output_tokens'])
+        rid = self.reserve(uid, model, estimate, cost)
+        started, response, status, usage = False, None, None, None
+        try:
+            status = self.bot.send_message(uid, '✦ Рисую…', reply_markup=keyboard([btn('⏹ Стоп', 'stop', 'danger')]))
+            if job.cancel.is_set():
+                raise Cancelled()
+            payload = {'model': model, 'prompt': prompt, 'n': 1}
+            started = True
+            response = self.provider(panel, uid).request('/images/generations', payload, read_timeout=180)
+            job.response = response
+            result = json.loads(bounded_response(response, 24 * 1024 * 1024, job.cancel))
+            usage = result.get('usage')
+            _, references = output_parts({'images': result.get('data', [])})
+            if not references:
+                raise ValueError('Панель не вернула картинку. Выбери модель изображений и проверь поддержку /images/generations.')
+            if job.cancel.is_set():
+                raise Cancelled()
+            as_file = bool(re.search(r'(?i)\b(?:файлом|оригинал|as a file)\b', prompt))
+            self.send_pictures(uid, job, references, as_file=as_file)
+            self.store.append(chat['id'], prompt, '[Создано изображение]')
+            if chat['title'] == 'Новый чат':
+                self.store.write('UPDATE chats SET title=? WHERE id=? AND owner=?', (prompt[:50], chat['id'], uid))
+            with self.menu_lock:
+                self.menu_ids.pop(uid, None)
+        finally:
+            if response is not None:
+                response.close()
+                response._ai_session.close()
+            if started:
+                incoming = int(usage.get('input_tokens', 0)) if isinstance(usage, dict) else estimate
+                outgoing = int(usage.get('output_tokens', 0)) if isinstance(usage, dict) else 0
+                self.charge(uid, rid, 'image', model, incoming, outgoing, cost, not bool(usage))
+            else:
+                self.store.write('DELETE FROM reservations WHERE id=?', (rid,))
+            if status is not None:
+                self.erase(status)
+
+
     def send_answer(self, uid, text, cid):
         with self.menu_lock:
             self.menu_ids.pop(uid, None)
@@ -1082,6 +1299,7 @@ class AIChat:
         estimated_cost = self.price(panel, model, incoming_est, outgoing_max)
         rid = self.reserve(uid, model, incoming_est + outgoing_max, estimated_cost)
         answer = ''
+        pictures = []
         usage = None
         response = None
         request_started = False
@@ -1113,13 +1331,15 @@ class AIChat:
                     if event.get('usage'):
                         usage = event['usage']
                     for choice in event.get('choices', []):
-                        delta = choice.get('delta', {}).get('content')
-                        if isinstance(delta, str):
-                            answer += delta
+                        chunk_text, chunk_pictures = output_parts(choice.get('delta', {}))
+                        answer += chunk_text
+                        pictures.extend(chunk_pictures)
+                        if len(pictures) > 4 or sum(map(len, pictures)) > 24 * 1024 * 1024:
+                            raise ValueError('Ответ содержит слишком много изображений.')
                         finish = choice.get('finish_reason') or finish
-                    if len(answer) > 120000:
+                    if len(answer) > 24 * 1024 * 1024:
                         raise ValueError('Ответ слишком большой; уменьши лимит генерации.')
-                    if now() - last_edit > 2 and answer:
+                    if now() - last_edit > 2 and answer and len(answer) < 120000 and 'data:image' not in answer:
                         try:
                             self.bot.edit_message_text('✦ ' + answer[-2800:], uid, status.message_id,
                                                        reply_markup=keyboard([btn('⏹ Стоп', 'stop', 'danger')]))
@@ -1127,22 +1347,32 @@ class AIChat:
                             pass
                         last_edit = now()
             else:
-                result = json.loads(bounded_response(response, 4 * 1024 * 1024))
+                result = json.loads(bounded_response(response, 24 * 1024 * 1024, job.cancel))
                 choice = result['choices'][0]
-                answer = choice['message'].get('content', '')
+                answer, pictures = output_parts(choice['message'])
                 finish = choice.get('finish_reason')
                 usage = result.get('usage')
             if job.cancel.is_set():
                 raise Cancelled()
-            if not isinstance(answer, str) or not answer.strip():
-                raise ValueError('Модель не вернула текст. Проверь модель и режим потока в настройках панели.')
-            self.store.append(chat['id'], content, answer)
+            # Some panels return images as Markdown rather than a separate field.
+            markdown_images = re.findall(r'!\[[^\]]*\]\((https://[^\s)]+|data:image/[^)\s]+)\)', answer)
+            if markdown_images:
+                pictures.extend(markdown_images)
+                answer = re.sub(r'!\[[^\]]*\]\((https://[^\s)]+|data:image/[^)\s]+)\)', '', answer).strip()
+            if not answer.strip() and not pictures:
+                raise ValueError('Модель не вернула текст или изображение. Проверь модель и режим потока панели.')
+            if len(answer) > 120000:
+                raise ValueError('Ответ слишком большой; уменьши лимит генерации.')
+            stored_answer = answer + ('\n[Изображение от ИИ]' if pictures else '')
+            self.store.append(chat['id'], content, stored_answer)
             if chat['title'] == 'Новый чат':
                 title = content if isinstance(content, str) else content[0].get('text', 'Изображение')
                 self.store.write('UPDATE chats SET title=? WHERE id=? AND owner=?', (title[:50], chat['id'], uid))
-            if fmt:
+            if pictures:
+                self.send_pictures(uid, job, pictures)
+            if fmt and answer.strip():
                 self.bot.send_document(uid, create_document(answer, fmt), caption='📎 AI Chat · ' + fmt.upper())
-            else:
+            elif answer.strip():
                 self.send_answer(uid, answer, chat['id'])
             if finish == 'length':
                 self.tell(uid, '⚠️ Достигнут лимит ответа модели. Ответ или файл может быть неполным.')
@@ -1186,9 +1416,9 @@ class AIChat:
         return raw
 
     def transcribe(self, uid, job, message):
-        panel = self.store.panel(uid)
+        panel = self.prepare_panel(uid)
         if not panel:
-            raise ValueError('Сначала добавь панель.')
+            raise ValueError('Сначала выбери доступную панель в меню «Панели».')
         obj = message.voice or message.audio
         raw = self.download(obj)
         seconds = getattr(obj, 'duration', 0) or 60
@@ -1198,9 +1428,11 @@ class AIChat:
         rid = self.reserve(uid, model, 0, cost)
         started = False
         response = None
+        status = None
         try:
             if job.cancel.is_set():
                 raise Cancelled()
+            status = self.bot.send_message(uid, '✦ Распознаю голос…', reply_markup=keyboard([btn('⏹ Стоп', 'stop', 'danger')]))
             started = True
             name = getattr(obj, 'file_name', None) or 'voice.ogg'
             response = self.provider(panel, uid).request('/audio/transcriptions', {'model': model},
@@ -1212,7 +1444,6 @@ class AIChat:
                 raise ValueError('Не удалось распознать речь.')
             if job.cancel.is_set():
                 raise Cancelled()
-            self.tell(uid, '🎙 Распознано:\n' + text)
         finally:
             if response is not None:
                 response.close()
@@ -1221,42 +1452,10 @@ class AIChat:
                 self.charge(uid, rid, 'transcription', model, 0, 0, cost, True)
             else:
                 self.store.write('DELETE FROM reservations WHERE id=?', (rid,))
-        # Speech and chat are two separately billable operations and budget checks.
-        self.generation(uid, job, text)
-
-    def speak(self, uid, job, cid):
-        chat = self.owned_chat(uid, cid)
-        panel = self.store.panel(uid, chat['panel'])
-        text = self.last_answer(uid, cid)
-        if len(text) > 4000:
-            raise ValueError('Для озвучки лимит 4000 символов. Сначала нажми «Короче».')
-        rate = self.cfg['speech_usd_per_million_characters']
-        cost = len(text) / 1000000 * float(rate) if rate is not None else None
-        model = self.cfg['speech_model']
-        rid = self.reserve(uid, model, 0, cost)
-        response = None
-        started = False
-        try:
-            if job.cancel.is_set():
-                raise Cancelled()
-            started = True
-            response = self.provider(panel, uid).request('/audio/speech',
-                {'model': model, 'voice': self.cfg['speech_voice'], 'input': text, 'response_format': 'mp3'})
-            job.response = response
-            audio = bounded_response(response, 15 * 1024 * 1024)
-            if job.cancel.is_set():
-                raise Cancelled()
-            buf = io.BytesIO(audio)
-            buf.name = 'AI-Chat.mp3'
-            self.bot.send_audio(uid, buf, caption='🔊 Голос сгенерирован ИИ')
-        finally:
-            if response is not None:
-                response.close()
-                response._ai_session.close()
-            if started:
-                self.charge(uid, rid, 'speech', model, 0, 0, cost, True)
-            else:
-                self.store.write('DELETE FROM reservations WHERE id=?', (rid,))
+            if status is not None:
+                self.erase(status)
+        # Transcription and the requested answer are separately billed API operations.
+        self.route_input(uid, job, text)
 
     def admin_menu(self, uid):
         if uid not in self.admins:
@@ -1408,6 +1607,12 @@ class AIChat:
                     return
                 elif command == '/help':
                     self.help_menu(uid)
+                    return
+                elif command == '/image':
+                    if args:
+                        self.launch(uid, lambda job: self.generate_image(uid, job, args[0]))
+                    else:
+                        self.image_prompt(uid)
                     return
                 elif command == '/models':
                     self.models(uid)
@@ -1572,12 +1777,12 @@ class AIChat:
                 elif action == 'save':
                     cid = int(parts[2])
                     self.bot.send_document(uid, create_document(self.last_answer(uid, cid), parts[1]))
-                elif action in ('rewrite', 'retry', 'speak'):
+                elif action == 'speak':
+                    self.tell(uid, 'Озвучка отключена. Ответы приходят текстом, изображениями и документами.')
+                elif action in ('rewrite', 'retry'):
                     cid = int(parts[-1])
                     self.owned_chat(uid, cid)
-                    if action == 'speak':
-                        self.launch(uid, lambda job: self.speak(uid, job, cid))
-                    elif action == 'retry':
+                    if action == 'retry':
                         self.launch(uid, lambda job: self.generation(uid, job, '', cid=cid, retry=True))
                     else:
                         prompts = {'short': 'Сократи предыдущий ответ, сохрани суть.', 'long': 'Раскрой предыдущий ответ подробнее с примерами.', 'simple': 'Объясни предыдущий ответ проще, понятными словами.'}
@@ -1590,6 +1795,8 @@ class AIChat:
                         raise ValueError('Неизвестный стиль ответа.')
                     self.store.write('INSERT INTO preferences(owner,style) VALUES(?,?) ON CONFLICT(owner) DO UPDATE SET style=excluded.style', (uid, parts[1]))
                     self.styles(uid)
+                elif action == 'imageprompt':
+                    self.image_prompt(uid)
                 elif action == 'settings':
                     self.settings(uid)
                 elif action == 'usage':
@@ -1811,6 +2018,7 @@ class AIChat:
             '🗂 Мои чаты': 'chats',
             '✚ Новый чат': 'newchat',
             '📄 Документы': 'formats',
+            '🖼 Нарисовать': 'imageprompt',
             '❔ Помощь': 'help',
             '🏠 Меню': 'home',
             '💬 Чаты': 'chats',
@@ -1896,6 +2104,11 @@ class AIChat:
             self.store.write('UPDATE users SET daily_tokens=?,daily_usd=? WHERE id=?', (tokens, usd, uid))
             self.states.pop(uid, None)
             self.usage(uid)
+        elif step == 'image_prompt':
+            if len(text) > 20000:
+                raise ValueError('Сократи описание до 20 000 символов.')
+            self.launch(uid, lambda job: self.generate_image(uid, job, text))
+            self.states.pop(uid, None)
         elif step == 'file_prompt':
             if len(text) > 20000:
                 raise ValueError('Сократи запрос до 20 000 символов.')
@@ -1907,12 +2120,10 @@ class AIChat:
         else:
             if len(text) > 20000:
                 raise ValueError('Сократи запрос до 20 000 символов.')
-            requested = re.search(r'(?i)(?:сделай|создай|подготовь|пришли|сохрани|оформи|отправь).{0,100}\b(pdf|docx|xlsx|txt|csv|markdown)\b', text)
-            fmt = requested.group(1).lower() if requested else None
-            fmt = 'md' if fmt == 'markdown' else fmt
-            self.launch(uid, lambda job: self.generation(uid, job, text, fmt=fmt))
+            self.launch(uid, lambda job: self.route_input(uid, job, text))
 
     def attachment(self, uid, job, message):
+        self.prepare_panel(uid)
         if message.content_type in ('voice', 'audio'):
             self.transcribe(uid, job, message)
             return
@@ -1929,7 +2140,8 @@ class AIChat:
             if clipped:
                 self.tell(uid, '⚠️ Для анализа взяты первые 60 000 символов документа.')
             content = (caption or 'Проанализируй документ и выдели главное.') + '\n\nФайл: ' + name + '\n--- Начало данных ---\n' + extracted + '\n--- Конец данных ---'
-        self.generation(uid, job, content)
+        output = requested_output(caption)
+        self.generation(uid, job, content, fmt=output if output in FORMATS else None)
 
     def maintenance(self):
         while not self.closed.is_set():
@@ -1948,7 +2160,8 @@ class AIChat:
         try:
             self.bot.set_my_commands([types.BotCommand('menu', 'Главное меню'), types.BotCommand('new', 'Новый чат'),
                                       types.BotCommand('models', 'Выбрать модель'), types.BotCommand('panels', 'Мои панели'),
-                                      types.BotCommand('chats', 'Мои чаты'), types.BotCommand('stop', 'Остановить ответ'),
+                                      types.BotCommand('chats', 'Мои чаты'), types.BotCommand('image', 'Нарисовать изображение'),
+                                      types.BotCommand('stop', 'Остановить ответ'),
                                       types.BotCommand('cancel', 'Отменить ввод'), types.BotCommand('help', 'Как пользоваться')])
             try:
                 self.bot.set_chat_menu_button(menu_button=types.MenuButtonCommands())
