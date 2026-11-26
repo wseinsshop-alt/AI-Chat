@@ -553,11 +553,20 @@ def requested_output(text):
                      r'(?:create|generate)\s+(?:an?\s+)?image\b)', text)
     if image:
         return 'image'
-    document = re.search(r'(?i)(?:сделай|создай|подготовь|пришли|сохрани|оформи|отправь|'
-                         r'create|send|save).{0,100}\b(pdf|пдф|docx|ворд|xlsx|эксель|txt|csv|markdown)\b', text)
-    if document:
-        return {'пдф': 'pdf', 'ворд': 'docx', 'эксель': 'xlsx', 'markdown': 'md'}.get(
-            document.group(1).lower(), document.group(1).lower())
+    document = re.search(r'(?i)\b(pdf|пдф(?:ку|ке|чик|чиком)?|docx|doc|word|ворд|'
+                         r'xlsx|xls|excel|эксель|txt|csv|markdown|md)\b', text)
+    intent = re.search(r'(?i)\b(?:сделай|создай|сформируй|сгенерируй|подготовь|'
+                       r'пришли|пришлите|скинь|скиньте|сбрось|сохрани|сохраните|'
+                       r'оформи|отправь|отправьте|выгрузи|экспортируй|'
+                       r'create|send|save|export|make)\b', text)
+    if document and intent:
+        kind = document.group(1).lower()
+        if kind.startswith('пдф'):
+            return 'pdf'
+        return {'doc': 'docx', 'word': 'docx', 'ворд': 'docx', 'xls': 'xlsx',
+                'excel': 'xlsx', 'эксель': 'xlsx', 'markdown': 'md'}.get(kind, kind)
+    if intent and re.search(r'(?i)\bфайлом\b', text):
+        return 'txt'
     return None
 
 
@@ -1284,7 +1293,7 @@ class AIChat:
         elif style == 'detailed':
             instruction += ' Объясняй подробно, структурированно, с примерами, когда они помогают.'
         if fmt:
-            instruction += f' Подготовь содержимое документа {fmt}. Файл создаст приложение; не обещай ссылку и не добавляй вводный комментарий.'
+            instruction += f' Пользователь запросил настоящий файл {fmt}. Приложение само создаст и прикрепит его в Telegram из твоего ответа. Подготовь только содержимое документа. Не пиши, что не можешь прикрепить файл, не обещай ссылку и не давай инструкций самостоятельного сохранения.'
             if fmt == 'xlsx':
                 instruction += ' Верни только JSON-массив строк таблицы: [["Заголовок"],["Значение"]], без ограждений.'
             elif fmt == 'csv':
@@ -1371,7 +1380,10 @@ class AIChat:
             if pictures:
                 self.send_pictures(uid, job, pictures)
             if fmt and answer.strip():
-                self.bot.send_document(uid, create_document(answer, fmt), caption='📎 AI Chat · ' + fmt.upper())
+                caption = '📎 AI Chat · ' + fmt.upper()
+                if fmt in ('pdf', 'docx', 'txt', 'md') and len(answer) <= 800:
+                    caption += '\n\n' + answer
+                self.bot.send_document(uid, create_document(answer, fmt), caption=caption)
             elif answer.strip():
                 self.send_answer(uid, answer, chat['id'])
             if finish == 'length':
