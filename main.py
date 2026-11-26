@@ -1366,7 +1366,8 @@ class AIChat:
             choices.append(btn('💬 '+self.compact_label(title),f'chatcfg:{c["id"]}'))
         rows = [choices[i:i+2] for i in range(0,len(choices),2)]
         rows += self.page_nav(page,pages,'chatpage')
-        rows += [[btn('✚ Новый чат','newchat'),btn('💬 Продолжить','resume')]]
+        rows += [[btn('✚ Новый чат','newchat'),btn('💬 Продолжить','resume')],
+                 [btn('🗑 Удалить все чаты','delete_all_chats','danger'),btn('↩ Назад','home')]]
         self.card(uid,f'💬 Мои чаты · {page+1}/{pages}',
                   'Нажми чат: открыть, переименовать, скачать историю или удалить. История видна только тебе.' if chats else
                   'Пока нет разговоров. Выбери модель и напиши первое сообщение.',keyboard(*rows))
@@ -2141,7 +2142,7 @@ class AIChat:
                     return
                 if uid in self.jobs and action not in ('home', 'usage'):
                     raise ValueError('Дождись ответа или нажми «Стоп», прежде чем менять настройки.')
-                if action not in ('confirmrestore', 'confirmcleardb', 'confirmrevoke', 'yespanel', 'yeschat'):
+                if action not in ('confirmrestore', 'confirmcleardb', 'confirmrevoke', 'yespanel', 'yeschat', 'confirm_all_chats'):
                     self.states.pop(uid, None)
                 if action == 'home':
                     self.home(uid)
@@ -2241,6 +2242,21 @@ class AIChat:
                         self.models(uid,query=cache.get('query',''),favorites=cache.get('favorites',False))
                     else:
                         self.select_model(uid,pid,model)
+                elif action == 'delete_all_chats':
+                    count = self.store.one('SELECT COUNT(*) AS n FROM chats WHERE owner=?',(uid,))['n']
+                    self.states[uid] = {'step':'delete_all_chats','expires':now()+300}
+                    self.card(uid,'🗑 Удалить все мои чаты?',
+                              f'Будут удалены все твои чаты и сообщения: {count}. Панели, избранное и настройки сохранятся. Отменить удаление нельзя.',
+                              keyboard([btn('Да, удалить все','confirm_all_chats','danger'),btn('Отмена','chats')]))
+                elif action == 'confirm_all_chats':
+                    state = self.states.get(uid,{})
+                    if state.get('step')!='delete_all_chats' or state.get('expires',0)<now():
+                        raise ValueError('Подтверждение истекло. Открой чаты заново.')
+                    with self.store.db() as c:
+                        c.execute('UPDATE users SET current_chat=NULL WHERE id=?',(uid,))
+                        c.execute('DELETE FROM chats WHERE owner=?',(uid,))
+                    self.states.pop(uid,None)
+                    self.chats(uid)
                 elif action in ('chats', 'chatpage'):
                     self.chats(uid, int(parts[1]) if action == 'chatpage' else 0)
                 elif action in ('chat', 'chatcfg', 'renamechat', 'delchat', 'yeschat', 'history'):
