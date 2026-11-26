@@ -397,6 +397,10 @@ class Store:
             old.unlink()
 
 
+class ProviderQuotaError(ValueError):
+    pass
+
+
 class Provider:
     def __init__(self, panel, cipher):
         self.url = panel['url']
@@ -414,7 +418,20 @@ class Provider:
                                        json=payload if files is None else None, data=payload if files else None,
                                        files=files, stream=True, timeout=(15, read_timeout), allow_redirects=False)
             if response.status_code != 200:
+                status = response.status_code
+                exhausted = status == 402
+                if status in (400,403,429):
+                    try:
+                        info = json.loads(bounded_response(response,65536))
+                        error = info.get('error',info)
+                        code = str(error.get('code','')) if isinstance(error,dict) else ''
+                        exhausted = code in ('insufficient_quota','quota_exceeded','insufficient_balance',
+                            'insufficient_funds','credit_balance_too_low','balance_exhausted','tokens_exhausted')
+                    except Exception:
+                        pass
                 response.close()
+                if exhausted:
+                    raise ProviderQuotaError('Баланс или квота API-панели исчерпаны.')
                 raise ValueError(f'API: HTTP {response.status_code}. Проверь base URL, ключ, модель, поддержку функции и баланс.')
             # Keep the session alive until the response is consumed.
             response._ai_session = session
@@ -1363,9 +1380,9 @@ class AIChat:
                     raise ValueError('Для отправки файлом нужны PNG, JPEG, WEBP или GIF.')
                 original = io.BytesIO(raw)
                 original.name = 'AI-Chat.' + ext
-                self.bot.send_document(uid, original, caption='🖼 Изображение от ИИ · оригинал')
+                self.bot.send_document(uid, original)
             else:
-                self.bot.send_photo(uid, photo, caption='🖼 Изображение от ИИ')
+                self.bot.send_photo(uid, photo)
 
     def generate_image(self, uid, job, prompt):
         if not prompt.strip() or len(prompt) > 20000:
@@ -1441,6 +1458,45 @@ class AIChat:
             self.bot.send_message(uid, chunk, parse_mode='HTML', reply_markup=self.bottom(uid))
 
     def generation(self, uid, job, content, cid=None, fmt=None, retry=False):
+        if job.cancel.is_set():
+            raise Cancelled()
+        self.require_subscription(uid)
+        chat = self.owned_chat(uid,cid) if cid else self.store.chat(uid)
+        original = (chat['panel'],chat['model'] or self.store.preferred_model(uid,self.store.panel(uid,chat['panel'])))
+        entries = []
+        for p in self.store.available_panels(uid):
+            try:
+                cached = self.catalog_cache.get(p['id'],{})
+                key = (p['url'],p['token'])
+                if cached.get('key')==key and cached.get('expires',0)>now():
+                    models = cached['models']
+                else:
+                    models = self.provider(p,uid).models()
+                    self.catalog_cache[p['id']] = {'key':key,'expires':now()+600,'models':models}
+                entries.extend((p['id'],m) for m in models)
+            except Exception:
+                continue
+        priorities = self.cfg.get('failover_priority',[])
+        reserves = [(pid,m) for pid,m in entries if m==original[1] and pid!=original[0]]
+        for model in priorities:
+            reserves.extend((pid,m) for pid,m in entries if m==model and (pid,m)!=original)
+        choices = list(dict.fromkeys([original]+reserves))
+        failed_panels = set()
+        for pid, model in choices:
+            if job.cancel.is_set():
+                raise Cancelled()
+            if pid in failed_panels or not self.store.panel(uid,pid):
+                continue
+            self.require_subscription(uid)
+            self.store.write('UPDATE chats SET panel=?,model=? WHERE id=? AND owner=?',(pid,model,chat['id'],uid))
+            self.store.write('UPDATE users SET active=?,current_chat=? WHERE id=?',(pid,chat['id'],uid))
+            try:
+                return self._generation_once(uid,job,content,cid=chat['id'],fmt=fmt,retry=retry)
+            except ProviderQuotaError:
+                failed_panels.add(pid)
+        raise ValueError('У доступных панелей исчерпан баланс. Администратор может пополнить их или настроить резервные модели.')
+
+    def _generation_once(self, uid, job, content, cid=None, fmt=None, retry=False):
         chat = self.owned_chat(uid, cid) if cid else self.store.chat(uid)
         panel = self.store.panel(uid, chat['panel'])
         if not panel:
@@ -1593,20 +1649,23 @@ class AIChat:
             for file in prepared_files:
                 if job.cancel.is_set():
                     raise Cancelled()
-                self.bot.send_document(uid, file, caption='📎 ' + file.name)
+                self.bot.send_document(uid, file)
             if pictures:
                 self.send_pictures(uid, job, pictures)
             if fmt and answer.strip() and not prepared_files:
-                caption = '📎 AI Chat · ' + fmt.upper()
-                if fmt in ('pdf', 'docx', 'txt', 'md') and len(answer) <= 800:
-                    caption += '\n\n' + answer
-                self.bot.send_document(uid, create_document(answer, fmt), caption=caption)
+                self.bot.send_document(uid, create_document(answer, fmt))
             elif answer.strip():
                 self.send_answer(uid, answer, chat['id'])
             for prompt in image_jobs:
-                self.generate_image(uid, job, prompt)
+                try:
+                    self.generate_image(uid, job, prompt)
+                except ProviderQuotaError:
+                    raise ValueError('Баланс API изображений исчерпан. Текстовый ответ сохранён.') from None
             if finish == 'length':
                 self.tell(uid, '⚠️ Достигнут лимит ответа модели. Ответ или файл может быть неполным.')
+        except ProviderQuotaError:
+            request_started = False
+            raise
         finally:
             if response is not None:
                 response.close()
@@ -1688,6 +1747,16 @@ class AIChat:
         # Transcription and the requested answer are separately billed API operations.
         self.route_input(uid, job, text)
 
+    def routing_settings(self, uid):
+        if uid not in self.admins:
+            raise ValueError('Нужны права администратора.')
+        order = self.cfg.get('failover_priority',[])
+        self.card(uid,'🔁 Резервные модели',
+                  'Сначала та же модель в другой разрешённой панели, затем модели по списку ниже.\n\n'+
+                  ('\n'.join(f'{i+1}. {m}' for i,m in enumerate(order)) or 'Список пока пуст.')+
+                  '\n\nПереключение — только при явной ошибке баланса/квоты, до начала ответа. Личные лимиты не обходятся.',
+                  keyboard([btn('✏️ Порядок','routing_edit'),btn('‹ Админка','admin')]))
+
     def admin_menu(self, uid):
         if uid not in self.admins:
             raise ValueError('Этот раздел доступен администратору.')
@@ -1698,6 +1767,7 @@ class AIChat:
         self.card(uid, '🛠 Управление ботом',
                   f'Пользователей: {users}\nТвоих панелей: {panels} · Выданных доступов: {shared}\n\n1. Добавь друга по ID или пригласи ссылкой.\n2. Выдай срок доступа в его карточке.\n3. Открой «Панели друга» и разреши нужные.',
                   keyboard([btn('👥 Друзья', 'friends'), btn('🔗 Пригласить', 'invite')],
+                           [btn('🔁 Резервные модели','routing'),btn('⚙️ Настройки','settings')],
                            [btn('✚ Друг по ID', 'addfriend'), btn('📚 Мои панели', 'panels')],
                            [btn('📤 Копия базы', 'backup'), btn('📥 Восстановить', 'restore')],
                            [btn('🗑 Очистить базу', 'cleardb', 'danger'), btn('🏠 Меню', 'home')]))
@@ -2013,6 +2083,14 @@ class AIChat:
                     self.store.write('UPDATE users SET verified=0 WHERE id=?', (uid,))
                     self.states.pop(uid, None)
                     self.tell(uid, 'Выход выполнен. /start — войти.')
+                elif action in ('routing','routing_edit'):
+                    if uid not in self.admins:
+                        raise ValueError('Нужны права администратора.')
+                    if action == 'routing':
+                        self.routing_settings(uid)
+                    else:
+                        self.states[uid] = {'step':'routing_edit'}
+                        self.tell(uid,'Введи API ID резервных моделей по одному в строке, в порядке приоритета. Например: gpt-4o-mini. До 30 моделей. Один дефис очищает список.')
                 elif action == 'admin':
                     self.admin_menu(uid)
                 elif action == 'subscription':
@@ -2256,7 +2334,23 @@ class AIChat:
             call = type('LocalCall', (), {'id': '', 'from_user': message.from_user, 'message': message, 'data': nav[text]})()
             self.callback(call)
             return
-        if step == 'friend_id':
+        if step == 'routing_edit':
+            if uid not in self.admins:
+                raise ValueError('Нужны права администратора.')
+            values = [] if text.strip()=='-' else [line.strip() for line in text.splitlines() if line.strip()]
+            if len(values)>30 or any(len(m)>200 or any(ord(c)<32 for c in m) for m in values):
+                raise ValueError('До 30 моделей, по одному API ID в строке.')
+            path = Path(os.environ.get('AI_CHAT_CONFIG',str(ROOT/'config.json')))
+            data = json.loads(path.read_text(encoding='utf-8'))
+            data['failover_priority'] = list(dict.fromkeys(values))
+            temp = path.with_suffix('.json.tmp')
+            temp.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
+            os.chmod(temp,0o600)
+            os.replace(temp,path)
+            self.cfg['failover_priority'] = data['failover_priority']
+            self.states.pop(uid,None)
+            self.routing_settings(uid)
+        elif step == 'friend_id':
             if uid not in self.admins:
                 raise ValueError('Нужны права администратора.')
             if not text.strip().isdigit() or int(text.strip()) <= 0 or len(text.strip()) > 18:
