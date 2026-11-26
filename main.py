@@ -449,12 +449,54 @@ class Provider:
             r.close()
             r._ai_session.close()
 
-    def models(self):
+    def model_records(self):
         found = self.json('/models').get('data', [])
+        return [m for m in found if isinstance(m,dict) and isinstance(m.get('id'),str) and m['id'].strip()]
+
+    def models(self):
+        found = self.model_records()
         result = [str(m['id']) for m in found if isinstance(m, dict) and 'id' in m]
         if not result:
             raise ValueError('Панель вернула пустой список моделей.')
         return result
+
+
+
+
+def readable_name(value):
+    return re.sub(r'[\s\u200b-\u200f\ufeff]+', ' ', str(value or '')).strip()
+
+
+def universal_model(records):
+    """Prefer declared image-input support; model-name hints are only a fallback."""
+    ranked = []
+    for item in records:
+        model = item.get('id','')
+        lower = model.casefold()
+        if re.search(r'(embed|rerank|whisper|transcri|tts|gpt-image|dall-e|flux|imagen|sdxl|moderation|sora)',lower):
+            continue
+        architecture = item.get('architecture') or {}
+        if not isinstance(architecture,dict):
+            architecture = {}
+        inputs = item.get('input_modalities', architecture.get('input_modalities'))
+        outputs = item.get('output_modalities',architecture.get('output_modalities'))
+        if outputs and 'text' not in outputs:
+            continue
+        capabilities = item.get('capabilities') or {}
+        if isinstance(capabilities,list):
+            capabilities = {'vision':'vision' in capabilities}
+        if not isinstance(capabilities,dict):
+            capabilities = {}
+        declared = bool(inputs is not None or 'vision' in capabilities or 'supports_vision' in item)
+        vision = ('image' in inputs if isinstance(inputs,list) else False) or capabilities.get('vision') is True or item.get('supports_vision') is True
+        hint = bool(re.search(r'(vision|[-/]vl\b|gpt-4o|gpt-4\.1|gpt-5|gemini|claude-3|claude-(sonnet|opus|haiku)-4)',lower))
+        score = 10000 if vision else (1000 if hint and not declared else 0)
+        score += 100 if any(name in lower for name in ('gpt','claude','gemini')) else 0
+        score += 30 if any(name in lower for name in ('pro','sonnet','gpt-5')) else 0
+        score -= 10 if any(name in lower for name in ('mini','nano','lite')) else 0
+        score -= 30 if any(name in lower for name in ('preview','experimental')) else 0
+        ranked.append((score,model))
+    return sorted(ranked,key=lambda pair:(-pair[0],pair[1]))[0][1] if ranked else ''
 
 
 def bounded_response(response, limit, cancel=None):
@@ -932,27 +974,21 @@ class AIChat:
 
     @staticmethod
     def model_label(model):
-        """Readable model label; keep the exact provider model ID for API calls."""
-        raw = (model or '').strip()
-        low = raw.casefold()
-        aliases = (
-            (('gpt-4o-mini',), 'GPT-4o mini'), (('gpt-4o',), 'GPT-4o'),
-            (('gpt-4.1-mini',), 'GPT-4.1 mini'), (('gpt-4.1-nano',), 'GPT-4.1 nano'),
-            (('gpt-4.1',), 'GPT-4.1'), (('gpt-3.5-turbo',), 'GPT-3.5 Turbo'),
-            (('claude-3-5-sonnet', 'claude-3.5-sonnet'), 'Claude 3.5 Sonnet'),
-            (('claude-3-7-sonnet', 'claude-3.7-sonnet'), 'Claude 3.7 Sonnet'),
-            (('claude-3-opus',), 'Claude 3 Opus'), (('claude-3-haiku',), 'Claude 3 Haiku'),
-            (('gemini-2.5-pro',), 'Gemini 2.5 Pro'), (('gemini-2.5-flash',), 'Gemini 2.5 Flash'),
-            (('gemini-2.0-flash',), 'Gemini 2.0 Flash'), (('deepseek-r1',), 'DeepSeek R1'),
-            (('deepseek-v3',), 'DeepSeek V3'), (('llama-3.3',), 'Llama 3.3'),
-            (('qwen2.5', 'qwen-2.5'), 'Qwen 2.5'),
-        )
-        for fragments, label in aliases:
-            if any(part in low for part in fragments):
-                return f'{label} · {raw}'
-        return raw
-
-
+        raw = str(model or '').strip()
+        name = raw.rsplit('/',1)[-1]
+        families = {'gpt':'GPT','chatgpt':'ChatGPT','claude':'Claude','gemini':'Gemini',
+                    'deepseek':'DeepSeek','qwen':'Qwen','llama':'Llama','mistral':'Mistral'}
+        for prefix, label in families.items():
+            if re.match(r'^'+prefix+r'(?=[\d_.-]|$)',name,re.I):
+                name = label + name[len(prefix):]
+                break
+        else:
+            name = raw
+        name = re.sub(r'(?i):free$', ' · Free', name)
+        name = name.replace('_',' ').replace('-',' ')
+        for word in ('mini','nano','flash','pro','sonnet','haiku','opus','instruct','vision','preview'):
+            name = re.sub(r'(?i)\b'+word+r'\b',word.capitalize(),name)
+        return re.sub(r'\s+',' ',name).strip() or 'Не выбрана'
 
     def tell(self, uid, text, keys=None, title=None):
         step = self.states.get(uid, {}).get('step')
@@ -977,11 +1013,11 @@ class AIChat:
                               parse_mode='HTML', reply_markup=self.bottom(uid, keys))
 
     def main_keys(self, uid):
-        rows = [[btn('🧠 Модели', 'models'), btn('🗂 Мои чаты', 'chats')],
-                [btn('✚ Новый чат', 'newchat'), btn('⭐ Избранное', 'models:favorites')],
-                [btn('⚙️ Настройки', 'settings'), btn('🎟 Мой доступ', 'subscription')]]
+        rows = [[btn('🧠 Модели','models'),btn('💬 Чаты','chats')],
+                [btn('✚ Новый чат','newchat'),btn('⭐ Избранное','models:favorites')],
+                [btn('⚙️ Настройки','settings'),btn('🎟 Доступ','subscription')]]
         if uid in self.admins:
-            rows.append([btn('🛠 Админка', 'admin'), btn('📚 Панели', 'panels')])
+            rows.append([btn('🛠 Админка','admin'),btn('📚 Панели','panels')])
         return keyboard(*rows)
 
     def bottom(self, uid, keys=None):
@@ -1033,24 +1069,15 @@ class AIChat:
             pass
 
     def authenticated(self, uid):
-        u = self.store.user(uid)
-        return bool(u and u['verified'] + self.cfg['session_hours'] * 3600 > now())
+        return bool(self.store.user(uid))
 
     def gate(self, uid):
         if not self.store.user(uid):
-            allowed = uid in self.admins or not self.cfg['invite_only'] or self.store.one('SELECT id FROM admitted WHERE id=?', (uid,))
+            allowed = uid in self.admins or not self.cfg['invite_only'] or self.store.one('SELECT id FROM admitted WHERE id=?',(uid,))
             if not allowed:
-                self.tell(uid, f'🔒 Вход по приглашению. Попроси администратора прислать ссылку или выдать доступ по твоему Telegram ID: {uid}.')
+                self.tell(uid,f'🔒 Доступ по приглашению. Твой Telegram ID: {uid}. Попроси администратора добавить тебя.')
                 return False
-            state = self.states.get(uid, {})
-            if state.get('step') not in ('register', 'register_confirm'):
-                self.states[uid] = {'step': 'register'}
-                self.tell(uid, '🔐 Создай личный пароль: 8–128 символов. Не используй пароль Telegram. Я постараюсь удалить сообщение с паролем.')
-            return False
-        if not self.authenticated(uid):
-            self.states[uid] = {'step': 'login'}
-            self.tell(uid, '🔐 Введи личный пароль. Вход действует ' + str(self.cfg['session_hours']) + ' ч.')
-            return False
+            self.store.write('INSERT INTO users(id,salt,hash,verified) VALUES(?,?,?,?)',(uid,'','',0))
         return True
 
     def subscription_label(self, uid):
@@ -1076,14 +1103,7 @@ class AIChat:
                   keyboard([btn('📚 Панели', 'panels'), btn('🏠 Меню', 'home')]))
 
     def verify_password(self, uid, text):
-        u = self.store.user(uid)
-        if not u or u['locked'] > now():
-            raise ValueError('Слишком много попыток. Подожди 5 минут.')
-        if not hmac.compare_digest(password_hash(text, u['salt']), u['hash']):
-            count = u['failures'] + 1
-            self.store.write('UPDATE users SET failures=?,locked=? WHERE id=?', (count, now() + 300 if count >= 5 else 0, uid))
-            raise ValueError('Неверный пароль.')
-        self.store.write('UPDATE users SET failures=0,locked=0 WHERE id=?', (uid,))
+        raise ValueError('Вход по паролю отключён. Используй /start.')
 
     def home(self, uid):
         self.states.pop(uid, None)
@@ -1200,7 +1220,7 @@ class AIChat:
         rows = []
         for i in range(page*6,min(len(visible),(page+1)*6)):
             pid, model, source = visible[i]
-            rows.append([btn('🤖 '+self.model_label(model)[:22]+' · '+source[:15],f'model:{cached["revision"]}:{i}'),
+            rows.append([btn(f'{i+1}. 🧠 '+self.model_label(model)[:32]+' · '+source[:16],f'model:{cached["revision"]}:{i}'),
                          btn('★ Убрать' if (pid,model) in favs else '☆ Сохранить',
                              f'favorite:{cached["revision"]}:{i}',
                              'success' if (pid,model) in favs else 'primary')])
@@ -1237,13 +1257,10 @@ class AIChat:
         return chat
 
     def settings(self, uid):
-        labels = {'balanced': 'обычный', 'short': 'краткий', 'detailed': 'подробный'}
-        self.card(uid, '⚙️ Настройки',
-                  'Стиль ответов: ' + labels[self.store.answer_style(uid)] +
-                  '\nЛичный пароль запрашивается повторно после окончания сессии.\n\nСтиль влияет на новые ответы, историю не удаляет.',
-                  keyboard([btn('✍️ Стиль ответа', 'styles'), btn('💰 Лимиты', 'limits')],
-                           [btn('🔐 Пароль', 'password'), btn('❔ Помощь', 'help')],
-                           [btn('🚪 Выйти', 'logout', 'danger'), btn('🏠 Меню', 'home')]))
+        labels = {'balanced':'обычный','short':'краткий','detailed':'подробный'}
+        self.card(uid,'⚙️ Личные настройки','Стиль: '+labels[self.store.answer_style(uid)]+
+                  '\nВход по Telegram ID, без пароля. Доступ к панелям выдаёт администратор.',
+                  keyboard([btn('✍️ Стиль','styles'),btn('💰 Лимиты','limits')]))
 
     def styles(self, uid):
         selected = self.store.answer_style(uid)
@@ -2076,13 +2093,9 @@ class AIChat:
                 elif action == 'limits':
                     self.states[uid] = {'step': 'limits'}
                     self.tell(uid, 'Отправь дневной лимит токенов и USD через пробел, например: 100000 2.\n0 — без лимита. Для USD нужны тарифы в config.json. Сутки по UTC.')
-                elif action == 'password':
-                    self.states[uid] = {'step': 'old_password'}
-                    self.tell(uid, 'Введи текущий пароль.')
-                elif action == 'logout':
-                    self.store.write('UPDATE users SET verified=0 WHERE id=?', (uid,))
-                    self.states.pop(uid, None)
-                    self.tell(uid, 'Выход выполнен. /start — войти.')
+                elif action in ('password','logout'):
+                    self.states.pop(uid,None)
+                    self.home(uid)
                 elif action in ('routing','routing_edit'):
                     if uid not in self.admins:
                         raise ValueError('Нужны права администратора.')
@@ -2170,15 +2183,15 @@ class AIChat:
                         raise ValueError('Нужны права администратора.')
                     if self.jobs:
                         raise ValueError('Перед импортом дождись завершения всех запросов.')
-                    self.states[uid] = {'step': 'import_password'}
-                    self.tell(uid, 'Подтверди свой пароль для импорта всей базы.')
+                    self.states[uid] = {'step': 'import_file','expires':now()+300}
+                    self.tell(uid, 'Пришли зашифрованную .enc-копию в течение 5 минут. Перед заменой потребуется подтверждение.')
                 elif action == 'cleardb':
                     if uid not in self.admins:
                         raise ValueError('Нужны права администратора.')
                     if self.jobs:
                         raise ValueError('Перед очисткой дождись завершения запросов.')
-                    self.states[uid] = {'step': 'clear_password', 'expires': now() + 300}
-                    self.tell(uid, '⚠️ Очистить пользователей, панели, чаты, приглашения и статистику? Перед очисткой сохранится зашифрованная копия. Подтверди личным паролем в течение 5 минут.')
+                    self.states[uid] = {'step':'clear_confirm','expires':now()+300}
+                    self.card(uid,'🗑 Очистить базу?', 'Будут удалены все пользователи, панели и чаты. Сначала сохранится зашифрованная копия. Подтверждение действует 5 минут.',keyboard([btn('Да, очистить','confirmcleardb','danger'),btn('Отмена','admin')]))
                 elif action == 'confirmcleardb':
                     state = self.states.get(uid, {})
                     if uid not in self.admins or state.get('step') != 'clear_confirm' or state.get('expires', 0) < now():
@@ -2200,7 +2213,7 @@ class AIChat:
                         self.store.restore(state['blob'])
                         self.states.clear()
                         self.cache.clear()
-                    self.tell(uid, 'База восстановлена. Сессии сброшены. /start — войти.')
+                    self.tell(uid, 'База восстановлена. /start — открыть чат.')
             except ValueError as error:
                 self.tell(uid, str(error))
             except Exception:
@@ -2234,59 +2247,12 @@ class AIChat:
             call = type('LocalCall',(),{'id':'','from_user':message.from_user,'message':message,'data':route})()
             self.callback(call)
             return
-        if text in self.reply_labels or text.startswith(('🤖 ', '☆ ', '★ ', '✓ ')):
+        if text in self.reply_labels or text.startswith(('🤖 ', '☆ ', '★ ', '✓ ')) or re.match(r'^\d+\. 🧠 ',text):
             self.tell(uid,'Эта кнопка устарела. Нажми /start.')
             return
         state = self.states.get(uid, {})
         step = state.get('step')
         u = self.store.user(uid)
-        auth_steps = ('register', 'register_confirm', 'login', 'old_password', 'new_password', 'new_password_confirm', 'import_password', 'clear_password')
-        if step in auth_steps and message.content_type == 'text':
-            self.erase(message)
-            if step == 'clear_password' and state.get('expires', 0) < now():
-                self.states.pop(uid, None)
-                raise ValueError('Подтверждение очистки истекло. База не изменена.')
-            if step not in ('register', 'register_confirm', 'login') and not self.authenticated(uid):
-                self.gate(uid)
-                return
-            if step in ('login', 'old_password', 'import_password', 'clear_password'):
-                self.verify_password(uid, text)
-                if step == 'old_password':
-                    self.states[uid] = {'step': 'new_password'}
-                    self.tell(uid, 'Новый пароль: 8–128 символов.')
-                elif step == 'import_password':
-                    if uid not in self.admins:
-                        raise ValueError('Нужны права администратора.')
-                    self.states[uid] = {'step': 'import_file', 'expires': now() + 300}
-                    self.tell(uid, 'Пришли .enc-копию в течение 5 минут. Нужен тот же secret.key.')
-                elif step == 'clear_password':
-                    if uid not in self.admins:
-                        raise ValueError('Нужны права администратора.')
-                    self.states[uid] = {'step': 'clear_confirm', 'expires': now() + 300}
-                    self.card(uid, 'Последнее подтверждение',
-                              'Это удалит данные всех пользователей, панели, историю, приглашения и статистику. Перед этим будет сделана зашифрованная копия. Продолжить?',
-                              keyboard([btn('🗑 Да, очистить всё', 'confirmcleardb', 'danger'),
-                                        btn('↩️ Отмена', 'admin')]))
-                    return
-                else:
-                    self.store.write('UPDATE users SET verified=? WHERE id=?', (now(), uid))
-                    self.home(uid)
-                return
-            if not 8 <= len(text) <= 128:
-                raise ValueError('Пароль должен содержать 8–128 символов.')
-            if step in ('register', 'new_password'):
-                salt = secrets.token_hex(16)
-                self.states[uid] = {'step': step + '_confirm', 'salt': salt, 'hash': password_hash(text, salt)}
-                self.tell(uid, 'Повтори пароль.')
-                return
-            if not hmac.compare_digest(password_hash(text, state['salt']), state['hash']):
-                raise ValueError('Пароли не совпали. Повтори или кнопка «🏠 Меню».')
-            if step == 'register_confirm' and u:
-                raise ValueError('Аккаунт уже существует. Начни /start.')
-            self.store.write('INSERT INTO users(id,salt,hash,verified) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET salt=excluded.salt,hash=excluded.hash,verified=excluded.verified,failures=0,locked=0',
-                             (uid, state['salt'], state['hash'], now()))
-            self.home(uid)
-            return
         if not self.gate(uid):
             return
         if uid in self.jobs:
@@ -2362,9 +2328,10 @@ class AIChat:
             self.states.pop(uid,None)
             raise ValueError('Панелями управляет только администратор.')
         elif step == 'panel_name':
-            if not text.strip() or len(text) > 60:
+            name = readable_name(text)
+            if not name or len(name) > 60:
                 raise ValueError('Название: 1–60 символов.')
-            self.states[uid] = {'step': 'panel_url', 'name': text.strip()}
+            self.states[uid] = {'step': 'panel_url', 'name': name}
             self.tell(uid, 'Пришли точный API base URL из панели. Ссылки вида /chat будут преобразованы в /v1.')
         elif step == 'panel_url':
             url = normalize_url(text)
@@ -2375,20 +2342,27 @@ class AIChat:
             self.erase(message)
             encrypted = self.store.cipher.encrypt(text.strip().encode()).decode()
             panel = {'url': state['url'], 'token': encrypted}
-            available = self.provider(panel).models()
-            pid = self.store.write('INSERT INTO panels(owner,name,url,token) VALUES(?,?,?,?)', (uid, state['name'], state['url'], encrypted))
+            records = self.provider(panel).model_records()
+            available = [m['id'] for m in records]
+            selected = universal_model(records)
+            if not selected:
+                raise ValueError('В панели не найдены разговорные модели. Добавление отменено.')
+            pid = self.store.write('INSERT INTO panels(owner,name,url,token,model) VALUES(?,?,?,?,?)', (uid, state['name'], state['url'], encrypted,selected))
+            self.store.write('INSERT INTO panel_choices VALUES(?,?,?)',(uid,pid,selected))
             self.store.write('UPDATE users SET active=?,current_chat=NULL WHERE id=?', (pid, uid))
             self.states.pop(uid, None)
             self.cache[uid] = {'panel': pid, 'all': available, 'expires': now() + 1800}
-            self.models(uid)
+            self.cache.pop(uid,None)
+            self.resume(uid)
         elif step in ('renamepanel', 'rekey'):
             panel = self.store.panel(uid, state['panel'])
             if not panel or panel['owner'] != uid:
                 raise ValueError('Панель не найдена или нет прав на изменение.')
             if step == 'renamepanel':
-                if not text.strip() or len(text) > 60:
+                name = readable_name(text)
+                if not name or len(name) > 60:
                     raise ValueError('Название: 1–60 символов.')
-                self.store.write('UPDATE panels SET name=? WHERE id=? AND owner=?', (text.strip(), panel['id'], uid))
+                self.store.write('UPDATE panels SET name=? WHERE id=? AND owner=?', (name, panel['id'], uid))
             else:
                 self.erase(message)
                 panel['token'] = self.store.cipher.encrypt(text.strip().encode()).decode()
@@ -2402,9 +2376,10 @@ class AIChat:
             self.states.pop(uid, None)
         elif step == 'renamechat':
             chat = self.owned_chat(uid, state['chat'])
-            if not text.strip() or len(text) > 80:
+            name = readable_name(text)
+            if not name or len(name) > 80:
                 raise ValueError('Название чата: 1–80 символов.')
-            self.store.write('UPDATE chats SET title=? WHERE id=? AND owner=?', (text.strip(), chat['id'], uid))
+            self.store.write('UPDATE chats SET title=? WHERE id=? AND owner=?', (name, chat['id'], uid))
             self.states.pop(uid, None)
             self.chats(uid)
         elif step == 'limits':
