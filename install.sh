@@ -29,7 +29,7 @@ rollback() {
   trap - ERR
   if (( mutated )); then
     systemctl stop ai-chat.service 2>/dev/null || true
-    for file in main.py README.md config.json requirements.txt install.sh; do
+    for file in main.py README.md config.json requirements.txt install.sh LICENSE; do
       if [[ -f "$stage/previous/$file" ]]; then cp -p "$stage/previous/$file" "$app/$file"; else rm -f "$app/$file"; fi
     done
     if [[ -f "$stage/previous/service" ]]; then cp -p "$stage/previous/service" "$unit"; else rm -f "$unit"; fi
@@ -66,7 +66,7 @@ json.loads((p/'config.json').read_text(encoding='utf-8'))
 PY
 mkdir -p "$app" "$data"
 chmod 700 "$data"
-for file in main.py README.md config.json requirements.txt install.sh; do
+for file in main.py README.md config.json requirements.txt install.sh LICENSE; do
   [[ ! -f "$app/$file" ]] || cp -p "$app/$file" "$stage/previous/$file"
 done
 [[ ! -f "$unit" ]] || cp -p "$unit" "$stage/previous/service"
@@ -125,7 +125,7 @@ else:
         shutil.copy2(old/'secret.key',data/'secret.key')
 PY
 if [[ -f "$stage/setup/settings.json" ]]; then cp "$stage/setup/settings.json" "$data/settings.json"; fi
-for file in main.py README.md requirements.txt install.sh; do cp "$stage/source/$file" "$app/$file"; done
+for file in main.py README.md requirements.txt install.sh LICENSE; do cp "$stage/source/$file" "$app/$file"; done
 # Preserve local behavior/price settings on updates.
 [[ -f "$app/config.json" ]] || cp "$stage/source/config.json" "$app/config.json"
 AI_CHAT_DATA_DIR="$data" PYTHONDONTWRITEBYTECODE=1 "$app/.venv/bin/python" -c "import sys; sys.path.insert(0,'$app'); import main; c=main.configuration(); main.Store(c['data_path'])"
