@@ -57,7 +57,8 @@ DEFAULTS = {'invite_only': True, 'session_hours': 24, 'backup_hours': 24,
             'backup_keep': 7, 'daily_tokens': 100000, 'daily_usd': 0,
             'max_output_tokens': 4096, 'history_messages': 20, 'max_file_mb': 10,
             'workers': 4, 'prices': {}, 'image_prices': {}, 'image_model': '', 'transcription_model': 'whisper-1',
-            'transcription_usd_per_minute': None,
+            'transcription_usd_per_minute': None, 'transcription_backend': 'auto',
+            'local_transcription_model': 'tiny', 'max_voice_seconds': 600,
             'system_prompt': 'Ты полезный помощник в Telegram. Не выдумывай выполненные действия.'}
 
 
@@ -990,6 +991,8 @@ class AIChat:
         self.menu_lock = threading.RLock()
         self.pool = ThreadPoolExecutor(max_workers=config['workers'])
         self.closed = threading.Event()
+        self.speech_lock = threading.Lock()
+        self.speech_model = None
         self.bot.register_message_handler(self.command, func=lambda message: telegram_command(message.text)[0]=='/start', content_types=['text'])
         self.bot.register_callback_query_handler(self.callback, func=lambda call: True)
         self.bot.register_message_handler(self.message, content_types=['text', 'photo', 'document', 'voice', 'audio'])
@@ -1837,21 +1840,101 @@ class AIChat:
 
     def download(self, obj):
         limit = min(19, int(self.cfg['max_file_mb'])) * 1024 * 1024
-        if not obj.file_size or obj.file_size > limit:
+        size = getattr(obj,'file_size',None)
+        if size is not None and (size < 0 or size > limit):
             raise ValueError(f'Лимит вложения: {limit // (1024 * 1024)} МБ.')
         info = self.bot.get_file(obj.file_id)
+        if (getattr(info,'file_size',None) or 0)>limit:
+            raise ValueError('Слишком большой файл.')
         # Telegram's getFile download URL contains the bot token; never send it to a panel.
         raw = self.bot.download_file(info.file_path)
         if len(raw) > limit:
             raise ValueError('Слишком большой файл.')
         return raw
 
+    def prepare_speech(self):
+        if self.speech_model is None:
+            try:
+                from faster_whisper import WhisperModel
+                options = dict(device='cpu',compute_type='int8',
+                    cpu_threads=max(1,min(2,os.cpu_count() or 1)),num_workers=1,
+                    download_root=str(self.cfg['data_path']/'speech-models'))
+                name = self.cfg.get('local_transcription_model','tiny')
+                try:
+                    self.speech_model = WhisperModel(name,local_files_only=True,**options)
+                except Exception:
+                    self.speech_model = WhisperModel(name,**options)
+            except Exception:
+                raise ValueError('Локальное распознавание не готово. Владелец сервера: выполни обновление установщиком или main.py --prepare-speech.') from None
+        return self.speech_model
+
+    def local_transcribe(self, uid, job, raw):
+        while not self.speech_lock.acquire(timeout=.25):
+            if job.cancel.is_set():
+                raise Cancelled()
+        try:
+            if job.cancel.is_set():
+                raise Cancelled()
+            model = self.prepare_speech()
+            segments, info = model.transcribe(io.BytesIO(raw),beam_size=1,best_of=1,
+                                             vad_filter=True,condition_on_previous_text=False)
+            parts = []
+            for segment in segments:
+                if job.cancel.is_set():
+                    raise Cancelled()
+                parts.append(segment.text.strip())
+                if sum(map(len,parts))>20000:
+                    raise ValueError('Слишком длинное голосовое. Отправь запись короче.')
+            text = ' '.join(parts).strip()
+            if not text:
+                raise ValueError('В голосовом не удалось найти речь. Попробуй запись без музыки и сильного шума.')
+            return text
+        finally:
+            self.speech_lock.release()
+
     def transcribe(self, uid, job, message):
+        self.require_subscription(uid)
+        if job.cancel.is_set():
+            raise Cancelled()
+        if not self.prepare_panel(uid):
+            raise ValueError('Попроси администратора выдать доступ к моделям.')
+        obj = message.voice or message.audio
+        if not obj:
+            raise ValueError('Отправь голосовое сообщение или аудиофайл.')
+        maximum = int(self.cfg.get('max_voice_seconds',600))
+        if (getattr(obj,'duration',0) or 0)>maximum:
+            raise ValueError(f'Голосовое слишком длинное. Максимум {maximum//60} минут.')
+        raw = self.download(obj)
+        mode = self.cfg.get('transcription_backend','auto')
+        if mode not in ('auto','api','local'):
+            raise ValueError('Неверная настройка transcription_backend.')
+        status = self.bot.send_message(uid,'✦ Распознаю голос…',
+                    reply_markup=keyboard([btn('⏹ Стоп','stop:'+job.token,'danger')]))
+        try:
+            text = None
+            if mode != 'local':
+                try:
+                    text = self.transcribe_api(uid,job,message,raw)
+                except Cancelled:
+                    raise
+                except Exception:
+                    if job.cancel.is_set():
+                        raise Cancelled()
+                    if mode=='api':
+                        raise ValueError('Панель не распознала аудио. Проверь модель и /audio/transcriptions или включи локальное распознавание.') from None
+            if text is None:
+                text = self.local_transcribe(uid,job,raw)
+            if job.cancel.is_set():
+                raise Cancelled()
+        finally:
+            self.erase(status)
+        self.route_input(uid,job,text)
+
+    def transcribe_api(self, uid, job, message, raw):
         panel = self.prepare_panel(uid)
         if not panel:
             raise ValueError('Сначала выбери доступную панель в меню «Панели».')
         obj = message.voice or message.audio
-        raw = self.download(obj)
         seconds = getattr(obj, 'duration', 0) or 60
         rate = self.cfg['transcription_usd_per_minute']
         cost = seconds / 60 * float(rate) if rate is not None else None
@@ -1863,7 +1946,6 @@ class AIChat:
         try:
             if job.cancel.is_set():
                 raise Cancelled()
-            status = self.bot.send_message(uid, '✦ Распознаю голос…', reply_markup=keyboard([btn('⏹ Стоп', 'stop:'+job.token, 'danger')]))
             started = True
             name = getattr(obj, 'file_name', None) or 'voice.ogg'
             response = self.provider(panel, uid).request('/audio/transcriptions', {'model': model},
@@ -1888,8 +1970,7 @@ class AIChat:
                 self.store.write('DELETE FROM reservations WHERE id=?', (rid,))
             if status is not None:
                 self.erase(status)
-        # Transcription and the requested answer are separately billed API operations.
-        self.route_input(uid, job, text)
+        return text
 
     def routing_settings(self, uid):
         if uid not in self.admins:
@@ -2620,10 +2701,19 @@ class AIChat:
 def main():
     parser = argparse.ArgumentParser(description='AI Chat — Telegram AI client')
     parser.add_argument('--setup', action='store_true', help='Configure credentials outside the repository')
+    parser.add_argument('--prepare-speech',action='store_true',help='Download and validate local speech recognition model')
     args = parser.parse_args()
     cfg = configuration(args.setup)
     if args.setup:
         print('Настройки сохранены вне репозитория: ' + str(cfg['data_path']))
+        return
+    if args.prepare_speech:
+        app = AIChat(cfg)
+        try:
+            app.prepare_speech()
+            print('Local speech model ready.')
+        finally:
+            app.pool.shutdown(wait=True)
         return
     AIChat(cfg).run()
 

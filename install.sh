@@ -129,6 +129,7 @@ for file in main.py README.md requirements.txt install.sh LICENSE; do cp "$stage
 # Preserve local behavior/price settings on updates.
 [[ -f "$app/config.json" ]] || cp "$stage/source/config.json" "$app/config.json"
 AI_CHAT_DATA_DIR="$data" PYTHONDONTWRITEBYTECODE=1 "$app/.venv/bin/python" -c "import sys; sys.path.insert(0,'$app'); import main; c=main.configuration(); main.Store(c['data_path'])"
+AI_CHAT_DATA_DIR="$data" "$app/.venv/bin/python" "$app/main.py" --prepare-speech
 cat > "$unit" <<'SERVICE'
 [Unit]
 Description=AI Chat Telegram Bot
