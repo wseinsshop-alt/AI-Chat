@@ -69,6 +69,14 @@ def day() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
+def telegram_command(text):
+    value = re.sub(r'^[\s\u200b\u200e\u200f\ufeff]+', '', str(text or ''))
+    if not value.startswith('/'):
+        return '', ''
+    parts = value.split(maxsplit=1)
+    return parts[0].split('@',1)[0].casefold(), parts[1] if len(parts)>1 else ''
+
+
 def password_hash(text: str, salt: str) -> str:
     return hashlib.pbkdf2_hmac('sha256', text.encode(), bytes.fromhex(salt), 300000).hex()
 
@@ -929,6 +937,7 @@ def create_document(text, fmt):
 class Job:
     cancel: threading.Event = field(default_factory=threading.Event)
     response: object = None
+    token: str = field(default_factory=lambda: secrets.token_hex(8))
 
 
 class Cancelled(Exception):
@@ -981,7 +990,7 @@ class AIChat:
         self.menu_lock = threading.RLock()
         self.pool = ThreadPoolExecutor(max_workers=config['workers'])
         self.closed = threading.Event()
-        self.bot.register_message_handler(self.command, commands=['start'])
+        self.bot.register_message_handler(self.command, func=lambda message: telegram_command(message.text)[0]=='/start', content_types=['text'])
         self.bot.register_callback_query_handler(self.callback, func=lambda call: True)
         self.bot.register_message_handler(self.message, content_types=['text', 'photo', 'document', 'voice', 'audio'])
 
@@ -1106,8 +1115,7 @@ class AIChat:
         keys = keys or self.main_keys(uid)
         items = [item for row in keys.to_dict().get('inline_keyboard',[]) for item in row
                  if item.get('callback_data') not in ('home','stop')]
-        items += [{'text':'🏠 Меню','callback_data':'home','style':'primary'},
-                  {'text':'⏹ Стоп','callback_data':'stop','style':'danger'}]
+        items += [{'text':'🏠 Меню','callback_data':'home','style':'primary'}]
         routes, buttons = {}, []
         for item in items:
             label = readable_name(item['text'])
@@ -1224,7 +1232,7 @@ class AIChat:
 
     def help_menu(self, uid):
         self.card(uid, '❔ Как пользоваться',
-                  'Выбери модель снизу и пиши как в обычном чате. Можно присылать фото, документы и голосовые. Проси картинки, PDF, таблицы или презентации прямо в сообщении.\n\nМодель можно сменить, сохранив текущий разговор. «Новый чат» начинает отдельную личную историю. Панелями управляет только администратор.\n\nЕдинственная команда — /start. Меню и остановка доступны кнопками внизу. Поддержка изображений и распознавания речи зависит от API-панели.',
+                  'Выбери модель снизу и пиши как в обычном чате. Можно присылать фото, документы и голосовые. Проси картинки, PDF, таблицы или презентации прямо в сообщении.\n\nМодель можно сменить, сохранив текущий разговор. «Новый чат» начинает отдельную личную историю. Панелями управляет только администратор.\n\nЕдинственная команда — /start. Меню доступно снизу; «Стоп» появляется только у текущего сообщения ожидания. Поддержка изображений и распознавания речи зависит от API-панели.',
                   self.main_keys(uid))
 
     def panels(self, uid, page=0):
@@ -1509,9 +1517,9 @@ class AIChat:
                     raise ValueError('Для отправки файлом нужны PNG, JPEG, WEBP или GIF.')
                 original = io.BytesIO(raw)
                 original.name = 'AI-Chat.' + ext
-                self.bot.send_document(uid, original)
+                self.bot.send_document(uid, original,reply_markup=self.bottom(uid))
             else:
-                self.bot.send_photo(uid, photo)
+                self.bot.send_photo(uid, photo,reply_markup=self.bottom(uid))
 
     def generate_image(self, uid, job, prompt):
         if not prompt.strip() or len(prompt) > 20000:
@@ -1543,7 +1551,7 @@ class AIChat:
         rid = self.reserve(uid, model, estimate, cost)
         started, response, status, usage = False, None, None, None
         try:
-            status = self.bot.send_message(uid, '✦ Рисую…', reply_markup=self.bottom(uid))
+            status = self.bot.send_message(uid, '✦ Рисую…', reply_markup=keyboard([btn('⏹ Стоп', 'stop:'+job.token, 'danger')]))
             if job.cancel.is_set():
                 raise Cancelled()
             payload = {'model': model, 'prompt': prompt, 'n': 1}
@@ -1699,7 +1707,7 @@ class AIChat:
         finish = None
         status = None
         try:
-            status = self.bot.send_message(uid, '✦ Думаю…', reply_markup=self.bottom(uid))
+            status = self.bot.send_message(uid, '✦ Думаю…', reply_markup=keyboard([btn('⏹ Стоп', 'stop:'+job.token, 'danger')]))
             if job.cancel.is_set():
                 raise Cancelled()
             payload = {'model': model, 'messages': messages, 'max_tokens': outgoing_max, 'stream': bool(panel['stream'])}
@@ -1734,7 +1742,8 @@ class AIChat:
                         raise ValueError('Ответ слишком большой; уменьши лимит генерации.')
                     if now() - last_edit > 2 and answer and len(answer) < 120000 and 'data:image' not in answer and 'ai-files' not in answer:
                         try:
-                            self.bot.edit_message_text('✦ ' + answer[-2800:], uid, status.message_id)
+                            self.bot.edit_message_text('✦ ' + answer[-2800:], uid, status.message_id,
+                                                       reply_markup=keyboard([btn('⏹ Стоп','stop:'+job.token,'danger')]))
                         except Exception:
                             pass
                         last_edit = now()
@@ -1781,11 +1790,11 @@ class AIChat:
             for file in prepared_files:
                 if job.cancel.is_set():
                     raise Cancelled()
-                self.bot.send_document(uid, file)
+                self.bot.send_document(uid, file,reply_markup=self.bottom(uid))
             if pictures:
                 self.send_pictures(uid, job, pictures)
             if fmt and answer.strip() and not prepared_files:
-                self.bot.send_document(uid, create_document(answer, fmt))
+                self.bot.send_document(uid, create_document(answer, fmt),reply_markup=self.bottom(uid))
             elif answer.strip():
                 self.send_answer(uid, answer, chat['id'])
             for prompt in image_jobs:
@@ -1854,7 +1863,7 @@ class AIChat:
         try:
             if job.cancel.is_set():
                 raise Cancelled()
-            status = self.bot.send_message(uid, '✦ Распознаю голос…', reply_markup=self.bottom(uid))
+            status = self.bot.send_message(uid, '✦ Распознаю голос…', reply_markup=keyboard([btn('⏹ Стоп', 'stop:'+job.token, 'danger')]))
             started = True
             name = getattr(obj, 'file_name', None) or 'voice.ogg'
             response = self.provider(panel, uid).request('/audio/transcriptions', {'model': model},
@@ -2010,12 +2019,12 @@ class AIChat:
             lock = self.user_locks.setdefault(uid, threading.RLock())
         with lock:
             try:
-                parts = message.text.split(maxsplit=1)
-                if parts[0].split('@')[0] != '/start':
+                command, argument = telegram_command(message.text)
+                if command != '/start':
                     self.tell(uid, 'Используй кнопки снизу или /start.')
                     return
-                if len(parts)>1 and parts[1].startswith('invite_'):
-                    self.admit(uid,parts[1][7:])
+                if argument.startswith('invite_'):
+                    self.admit(uid,argument[7:])
                 self.states.pop(uid,None)
                 if self.gate(uid):
                     self.home(uid)
@@ -2042,6 +2051,9 @@ class AIChat:
                 if uid not in self.admins and action in ('panels','panelpage','panel','panelcfg','addpanel','renamepanel','rekey','stream','check','delpanel','yespanel'):
                     raise ValueError('Панелями управляет только администратор.')
                 if action == 'stop':
+                    job = self.jobs.get(uid)
+                    if len(parts)>1 and (not job or parts[1]!=job.token):
+                        return
                     self.stop(uid)
                     return
                 if action == 'noop':
@@ -2373,8 +2385,9 @@ class AIChat:
         with self.menu_lock:
             self.menu_ids.pop(uid, None)
         text = message.text or ''
-        if text.startswith('/'):
-            if text.split()[0].split('@')[0] == '/start':
+        command, _ = telegram_command(text)
+        if command:
+            if command == '/start':
                 self.command(message)
             else:
                 self.tell(uid,'Осталась только команда /start. Остальное — кнопками снизу.')
