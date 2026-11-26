@@ -124,11 +124,15 @@ def configuration(setup=False):
         token = getpass.getpass('Токен Telegram (Enter — сохранить текущий): ').strip()
         if token:
             cfg['telegram_token'] = token
-        ids = input('Telegram ID администраторов через запятую: ').strip()
+        ids = input('Telegram ID администраторов через запятую (Enter — сохранить текущие): ').strip()
         if ids:
             cfg['admin_ids'] = [int(x.strip()) for x in ids.split(',')]
         if not cfg['telegram_token'] or not cfg['admin_ids']:
             raise ValueError('Нужны токен и хотя бы один ID администратора.')
+        if not re.fullmatch(r'[0-9]+:[A-Za-z0-9_-]{20,}', cfg['telegram_token']):
+            raise ValueError('Неверный формат токена. Скопируй полный токен из BotFather.')
+        if any(not isinstance(uid, int) or uid <= 0 for uid in cfg['admin_ids']):
+            raise ValueError('Telegram ID администратора должен быть положительным числом.')
         saved.write_text(json.dumps({k: cfg[k] for k in ('telegram_token', 'admin_ids')}), encoding='utf-8')
         os.chmod(saved, 0o600)
     cfg['data_path'] = data
@@ -148,8 +152,10 @@ CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT,
  chat INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,role TEXT NOT NULL,content TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS favorites(owner INTEGER,panel INTEGER REFERENCES panels(id) ON DELETE CASCADE,
  model TEXT,PRIMARY KEY(owner,panel,model));
-CREATE TABLE IF NOT EXISTS invites(code TEXT PRIMARY KEY,uses INTEGER NOT NULL,expires REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS invites(code TEXT PRIMARY KEY,uses INTEGER NOT NULL,expires REAL NOT NULL,days INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS admitted(id INTEGER PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS subscriptions(id INTEGER PRIMARY KEY,expires REAL NOT NULL DEFAULT 0,
+ blocked INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS usage(id INTEGER PRIMARY KEY AUTOINCREMENT,owner INTEGER,day TEXT,kind TEXT,
  model TEXT,input_tokens INTEGER,output_tokens INTEGER,cost REAL,estimated INTEGER,created REAL);
 CREATE TABLE IF NOT EXISTS reservations(id TEXT PRIMARY KEY,owner INTEGER,day TEXT,tokens INTEGER,cost REAL);
@@ -157,7 +163,7 @@ CREATE TABLE IF NOT EXISTS reservations(id TEXT PRIMARY KEY,owner INTEGER,day TE
 
 
 class Store:
-    TABLES = ('users', 'panels', 'chats', 'messages', 'favorites', 'invites', 'admitted', 'usage')
+    TABLES = ('users', 'panels', 'chats', 'messages', 'favorites', 'invites', 'admitted', 'subscriptions', 'usage')
 
     def __init__(self, data: Path):
         self.data = data
@@ -170,7 +176,13 @@ class Store:
             os.chmod(key, 0o600)
         self.cipher = Fernet(key.read_bytes().strip())
         with self.db() as c:
+            migrate_subscriptions = not c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='subscriptions'").fetchone()
             c.executescript(SCHEMA)
+            if migrate_subscriptions:
+                c.execute('INSERT OR IGNORE INTO subscriptions(id) SELECT id FROM users')
+                c.execute('INSERT OR IGNORE INTO subscriptions(id) SELECT id FROM admitted')
+            if 'days' not in [r['name'] for r in c.execute('PRAGMA table_info(invites)')]:
+                c.execute('ALTER TABLE invites ADD COLUMN days INTEGER NOT NULL DEFAULT 0')
             # Upgrade the previous tg-ai-cabinet schema without replacing its tables.
             for table, field_name, definition in (
                 ('users', 'current_chat', 'INTEGER'), ('users', 'daily_tokens', 'INTEGER'),
@@ -217,6 +229,29 @@ class Store:
     def user(self, uid):
         return self.one('SELECT * FROM users WHERE id=?', (uid,))
 
+    def subscription(self, uid):
+        return self.one('SELECT * FROM subscriptions WHERE id=?', (uid,))
+
+    def has_subscription(self, uid):
+        row = self.subscription(uid)
+        return bool(row and not row['blocked'] and (row['expires'] == 0 or row['expires'] > now()))
+
+    def grant_subscription(self, uid, days):
+        if uid <= 0 or days not in (0, 7, 30, 90):
+            raise ValueError('Нужны положительный Telegram ID и срок 7, 30, 90 дней или без срока.')
+        with self.db() as c:
+            c.execute('BEGIN IMMEDIATE')
+            old = c.execute('SELECT * FROM subscriptions WHERE id=?', (uid,)).fetchone()
+            base = max(now(), old['expires']) if old and not old['blocked'] else now()
+            expires = 0 if days == 0 else base + days * 86400
+            # A finite extension must not shorten an existing unlimited grant.
+            if old and not old['blocked'] and old['expires'] == 0:
+                expires = 0
+            c.execute('INSERT OR IGNORE INTO admitted(id) VALUES(?)', (uid,))
+            c.execute('INSERT INTO subscriptions(id,expires,blocked) VALUES(?,?,0) '
+                      'ON CONFLICT(id) DO UPDATE SET expires=excluded.expires,blocked=0', (uid, expires))
+        return expires
+
     def panel(self, uid, pid=None):
         if pid is None:
             u = self.user(uid)
@@ -261,15 +296,21 @@ class Store:
     def backup(self):
         with self.db() as c:
             c.execute('BEGIN')
-            payload = {'version': 2, 'created': now()}
+            payload = {'version': 3, 'created': now()}
             for table in self.TABLES:
                 payload[table] = [dict(r) for r in c.execute('SELECT * FROM ' + table)]
         return self.cipher.encrypt(json.dumps(payload, ensure_ascii=False).encode())
 
     def decode_backup(self, blob):
         payload = json.loads(self.cipher.decrypt(blob))
-        if payload.get('version') != 2 or not all(isinstance(payload.get(t), list) for t in self.TABLES):
-            raise ValueError('Нужна резервная копия AI Chat версии 2 и исходный secret.key.')
+        if payload.get('version') == 2:
+            existing = {int(r['id']) for r in payload.get('users', []) + payload.get('admitted', [])}
+            payload['subscriptions'] = [{'id': uid, 'expires': 0, 'blocked': 0} for uid in existing]
+            for invite in payload.get('invites', []):
+                invite.setdefault('days', 0)
+            payload['version'] = 3
+        if payload.get('version') != 3 or not all(isinstance(payload.get(t), list) for t in self.TABLES):
+            raise ValueError('Нужна резервная копия AI Chat версии 2/3 и исходный secret.key.')
         for panel in payload['panels']:
             normalize_url(panel['url'])
             self.cipher.decrypt(panel['token'].encode())
@@ -307,6 +348,8 @@ class Store:
             c.execute('DELETE FROM reservations')
             for table in reversed(self.TABLES):
                 c.execute('DELETE FROM ' + table)
+            if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history'").fetchone():
+                c.execute('DELETE FROM history')
 
     def automatic_backup(self, hours=24, keep=7, force=False):
         folder = self.data / 'backups'
@@ -572,7 +615,7 @@ class AIChat:
         self.user_locks = {}
         self.pool = ThreadPoolExecutor(max_workers=config['workers'])
         self.closed = threading.Event()
-        self.bot.register_message_handler(self.command, commands=['start', 'menu', 'help', 'cancel', 'stop', 'new', 'backup', 'invite'])
+        self.bot.register_message_handler(self.command, commands=['start', 'menu', 'help', 'cancel', 'stop', 'new', 'backup', 'invite', 'subscription'])
         self.bot.register_callback_query_handler(self.callback, func=lambda call: True)
         self.bot.register_message_handler(self.message, content_types=['text', 'photo', 'document', 'voice', 'audio'])
 
@@ -598,48 +641,7 @@ class AIChat:
                 return f'{label} · {raw}'
         return raw
 
-    def model_label(model):
-        """Readable display name; keep the exact provider model ID for API calls."""
-        raw = (model or '').strip()
-        low = raw.casefold()
-        aliases = (
-            (('gpt-4o-mini',), 'GPT-4o mini'), (('gpt-4o',), 'GPT-4o'),
-            (('gpt-4.1-mini',), 'GPT-4.1 mini'), (('gpt-4.1-nano',), 'GPT-4.1 nano'),
-            (('gpt-4.1',), 'GPT-4.1'), (('gpt-3.5-turbo',), 'GPT-3.5 Turbo'),
-            (('claude-3-5-sonnet', 'claude-3.5-sonnet'), 'Claude 3.5 Sonnet'),
-            (('claude-3-7-sonnet', 'claude-3.7-sonnet'), 'Claude 3.7 Sonnet'),
-            (('claude-3-opus',), 'Claude 3 Opus'), (('claude-3-haiku',), 'Claude 3 Haiku'),
-            (('gemini-2.5-pro',), 'Gemini 2.5 Pro'), (('gemini-2.5-flash',), 'Gemini 2.5 Flash'),
-            (('gemini-2.0-flash',), 'Gemini 2.0 Flash'), (('deepseek-r1',), 'DeepSeek R1'),
-            (('deepseek-v3',), 'DeepSeek V3'), (('llama-3.3',), 'Llama 3.3'),
-            (('qwen2.5', 'qwen-2.5'), 'Qwen 2.5'),
-        )
-        for fragments, label in aliases:
-            if any(part in low for part in fragments):
-                return f'{label} · {raw}'
-        return raw
 
-    @staticmethod
-    def model_label(model):
-        """Readable model label; API requests still use the provider ID."""
-        raw = (model or '').strip()
-        low = raw.casefold()
-        aliases = (
-            (('gpt-4o-mini',), 'GPT-4o mini'), (('gpt-4o',), 'GPT-4o'),
-            (('gpt-4.1-mini',), 'GPT-4.1 mini'), (('gpt-4.1-nano',), 'GPT-4.1 nano'),
-            (('gpt-4.1',), 'GPT-4.1'), (('gpt-3.5-turbo',), 'GPT-3.5 Turbo'),
-            (('claude-3-5-sonnet', 'claude-3.5-sonnet'), 'Claude 3.5 Sonnet'),
-            (('claude-3-7-sonnet', 'claude-3.7-sonnet'), 'Claude 3.7 Sonnet'),
-            (('claude-3-opus',), 'Claude 3 Opus'), (('claude-3-haiku',), 'Claude 3 Haiku'),
-            (('gemini-2.5-pro',), 'Gemini 2.5 Pro'), (('gemini-2.5-flash',), 'Gemini 2.5 Flash'),
-            (('gemini-2.0-flash',), 'Gemini 2.0 Flash'), (('deepseek-r1',), 'DeepSeek R1'),
-            (('deepseek-v3',), 'DeepSeek V3'), (('llama-3.3',), 'Llama 3.3'),
-            (('qwen2.5', 'qwen-2.5'), 'Qwen 2.5'),
-        )
-        for fragments, label in aliases:
-            if any(part in low for part in fragments):
-                return f'{label} · {raw}'
-        return raw
 
     def tell(self, uid, text, keys=None, title=None):
         if title:
@@ -670,7 +672,7 @@ class AIChat:
         if not self.store.user(uid):
             allowed = uid in self.admins or not self.cfg['invite_only'] or self.store.one('SELECT id FROM admitted WHERE id=?', (uid,))
             if not allowed:
-                self.tell(uid, '🔒 Вход по приглашению. Попроси администратора прислать ссылку.')
+                self.tell(uid, f'🔒 Вход по приглашению. Попроси администратора прислать ссылку или выдать доступ по твоему Telegram ID: {uid}.')
                 return False
             state = self.states.get(uid, {})
             if state.get('step') not in ('register', 'register_confirm'):
@@ -682,6 +684,28 @@ class AIChat:
             self.tell(uid, '🔐 Введи личный пароль. Вход действует ' + str(self.cfg['session_hours']) + ' ч.')
             return False
         return True
+
+    def subscription_label(self, uid):
+        if uid in self.admins:
+            return 'Администратор · без срока'
+        row = self.store.subscription(uid)
+        if not row:
+            return 'Ожидает выдачи доступа администратором'
+        if row['blocked']:
+            return 'Доступ отключён администратором'
+        if not row['expires']:
+            return 'Активна · без срока'
+        stamp = datetime.fromtimestamp(row['expires'], timezone.utc).strftime('%d.%m.%Y %H:%M UTC')
+        return ('Активна до ' if row['expires'] > now() else 'Истекла ') + stamp
+
+    def require_subscription(self, uid):
+        if uid not in self.admins and not self.store.has_subscription(uid):
+            raise ValueError('Доступ к ИИ не активен. Открой «🎟 Мой доступ» и попроси администратора выдать или продлить подписку.')
+
+    def subscription_info(self, uid):
+        self.card(uid, '🎟 Мой доступ', self.subscription_label(uid) +
+                  f'\nТвой Telegram ID: {uid}\n\nАдминистратор выдаёт и продлевает доступ. Панели, API-ключи и расходы у каждого свои.',
+                  keyboard([btn('🏠 Кабинет', 'home')]))
 
     def verify_password(self, uid, text):
         u = self.store.user(uid)
@@ -702,6 +726,7 @@ class AIChat:
             body = (f"🟢 Панель: {p['name']}\n"
                     f"🧠 Модель: {self.model_label(chat['model'] or p['model'])}\n"
                     f"💬 Чат: {chat['title']}")
+        body += '\n\n🎟 ' + self.subscription_label(uid)
         body += '\n\nОтправляй сообщение, фото с подписью или документ. Для нового диалога нажми «Новый чат».'
         self.bot.send_message(uid, '✨ AI CHAT  ·  личный кабинет',
                               reply_markup=types.ReplyKeyboardRemove())
@@ -710,6 +735,7 @@ class AIChat:
             [btn('💬 Чаты', 'chats'), btn('🆕 Новый чат', 'newchat', 'success')],
             [btn('⭐ Избранное', 'models:favorites', 'success'), btn('📎 Создать файл', 'formats')],
             [btn('💰 Расходы', 'usage'), btn('⚙️ Настройки', 'settings')],
+            [btn('🎟 Мой доступ', 'subscription')],
         ]
         if uid in self.admins:
             rows.append([btn('🛠 Админка · доступы', 'admin')])
@@ -738,34 +764,6 @@ class AIChat:
     def provider(self, panel):
         return Provider(panel, self.store.cipher)
 
-    @staticmethod
-    def model_label(model):
-        """Readable display name; retain the provider's exact model ID for API calls."""
-        raw = (model or '').strip()
-        low = raw.casefold()
-        aliases = (
-            (('gpt-4o-mini',), 'GPT-4o mini'),
-            (('gpt-4o',), 'GPT-4o'),
-            (('gpt-4.1-mini',), 'GPT-4.1 mini'),
-            (('gpt-4.1-nano',), 'GPT-4.1 nano'),
-            (('gpt-4.1',), 'GPT-4.1'),
-            (('gpt-3.5-turbo',), 'GPT-3.5 Turbo'),
-            (('claude-3-5-sonnet', 'claude-3.5-sonnet'), 'Claude 3.5 Sonnet'),
-            (('claude-3-7-sonnet', 'claude-3.7-sonnet'), 'Claude 3.7 Sonnet'),
-            (('claude-3-opus', 'claude-3.0-opus'), 'Claude 3 Opus'),
-            (('claude-3-haiku', 'claude-3.0-haiku'), 'Claude 3 Haiku'),
-            (('gemini-2.5-pro',), 'Gemini 2.5 Pro'),
-            (('gemini-2.5-flash',), 'Gemini 2.5 Flash'),
-            (('gemini-2.0-flash',), 'Gemini 2.0 Flash'),
-            (('deepseek-r1',), 'DeepSeek R1'),
-            (('deepseek-v3',), 'DeepSeek V3'),
-            (('llama-3.3',), 'Llama 3.3'),
-            (('qwen2.5', 'qwen-2.5'), 'Qwen 2.5'),
-        )
-        for fragments, label in aliases:
-            if any(part in low for part in fragments):
-                return f'{label} · {raw}'
-        return raw
 
     def models(self, uid, page=0, query='', favorites=False, refresh=False):
         p = self.store.panel(uid)
@@ -847,6 +845,7 @@ class AIChat:
                   keyboard([btn('Настроить лимиты', 'limits'), btn('🏠 Кабинет', 'home')]))
 
     def reserve(self, uid, model, tokens, estimated_cost):
+        self.require_subscription(uid)
         u = self.store.user(uid)
         token_limit = u['daily_tokens'] if u['daily_tokens'] is not None else self.cfg['daily_tokens']
         usd_limit = u['daily_usd'] if u['daily_usd'] is not None else self.cfg['daily_usd']
@@ -879,6 +878,7 @@ class AIChat:
 
     def launch(self, uid, function):
         with self.lock:
+            self.require_subscription(uid)
             if uid in self.jobs:
                 raise ValueError('Уже выполняется запрос. Нажми «Стоп» или дождись ответа.')
             if len(self.jobs) >= self.cfg['workers'] * 2:
@@ -1140,23 +1140,68 @@ class AIChat:
     def admin_menu(self, uid):
         if uid not in self.admins:
             raise ValueError('Этот раздел доступен администратору.')
+        self.states.pop(uid, None)
         users = self.store.one('SELECT COUNT(*) AS n FROM users')['n']
         self.card(uid, '🛠 Админка · доступы и база',
                   f'Пользователей: {users}\nРежим: ' + ('только по приглашению' if self.cfg['invite_only'] else 'регистрация открыта') +
                   '\n\nЧтобы добавить человека: нажми «🔗 Создать приглашение» и перешли ему ссылку. Он открывает её в Telegram и задаёт свой пароль. Ссылка одноразовая и действует 24 часа.',
                   keyboard(
+                      [btn('👥 Друзья и подписки', 'friends', 'success')],
                       [btn('🔗 Создать приглашение', 'invite', 'success')],
                       [btn('📤 Экспорт БД', 'backup'), btn('📥 Импорт БД', 'restore')],
                       [btn('🗑 Очистить базу', 'cleardb', 'danger')],
                       [btn('🏠 В кабинет', 'home')]))
 
-    def invite(self, uid):
+    def friends(self, uid, page=0):
         if uid not in self.admins:
             raise ValueError('Нужны права администратора.')
+        rows = self.store.rows('SELECT id FROM users UNION SELECT id FROM admitted UNION SELECT id FROM subscriptions ORDER BY id')
+        friends = [r['id'] for r in rows if r['id'] not in self.admins]
+        total = max(1, math.ceil(len(friends) / 8))
+        page = max(0, min(page, total - 1))
+        buttons = [[btn(f"{friend} · {self.subscription_label(friend)}"[:60], f'friend:{friend}')]
+                   for friend in friends[page * 8:(page + 1) * 8]]
+        nav = []
+        if page:
+            nav.append(btn('← Назад', f'friendpage:{page - 1}'))
+        if page + 1 < total:
+            nav.append(btn('Далее →', f'friendpage:{page + 1}'))
+        if nav:
+            buttons.append(nav)
+        buttons += [[btn('➕ Добавить / найти по ID', 'addfriend', 'success')],
+                    [btn('🔗 Приглашение', 'invite'), btn('🛠 Админка', 'admin')]]
+        self.card(uid, f'👥 Друзья · {len(friends)} · {page + 1}/{total}',
+                  'Открой друга, чтобы выдать, продлить или отключить доступ. Новый друг сначала задаёт свой пароль через /start.',
+                  keyboard(*buttons))
+
+    def friend_card(self, uid, friend):
+        if uid not in self.admins:
+            raise ValueError('Нужны права администратора.')
+        if friend <= 0 or friend in self.admins:
+            raise ValueError('Укажи ID друга. У администраторов доступ без срока.')
+        self.card(uid, f'👤 Telegram ID {friend}', self.subscription_label(friend) +
+                  '\n\nСрок продлевается от текущего окончания. Бессрочный доступ сохраняется при продлении. Чтобы заменить его сроком, сначала отключи доступ.',
+                  keyboard([btn('+7 дней', f'grant:{friend}:7', 'success'), btn('+30 дней', f'grant:{friend}:30', 'success')],
+                           [btn('+90 дней', f'grant:{friend}:90', 'success'), btn('Без срока', f'grant:{friend}:0', 'success')],
+                           [btn('⛔ Отключить', f'revokefriend:{friend}', 'danger'), btn('👥 К друзьям', 'friends')]))
+
+    def invite(self, uid, days=None):
+        if uid not in self.admins:
+            raise ValueError('Нужны права администратора.')
+        if days is None:
+            self.card(uid, '🔗 Пригласить друга',
+                      'Выбери срок доступа. Подписка начнётся, когда новый друг откроет ссылку. Ссылка одноразовая и действует 24 часа.',
+                      keyboard([btn('7 дней', 'invite:7', 'success'), btn('30 дней', 'invite:30', 'success')],
+                               [btn('90 дней', 'invite:90', 'success'), btn('Без срока', 'invite:0', 'success')],
+                               [btn('🛠 Админка', 'admin')]))
+            return
+        if days not in (0, 7, 30, 90):
+            raise ValueError('Неизвестный срок доступа.')
         code = secrets.token_urlsafe(18)
-        self.store.write('INSERT INTO invites VALUES(?,?,?)', (code, 1, now() + 86400))
+        self.store.write('INSERT INTO invites(code,uses,expires,days) VALUES(?,?,?,?)', (code, 1, now() + 86400, days))
         name = self.bot.get_me().username
-        self.tell(uid, f'🔗 Ссылка готова — перешли её человеку, которого хочешь добавить. Она работает один раз и истекает через 24 часа.\n\nhttps://t.me/{name}?start=invite_{code}')
+        term = f'{days} дней' if days else 'без срока'
+        self.tell(uid, f'🔗 Доступ: {term}. Перешли ссылку другу. Она действует один раз, в течение 24 часов.\n\nhttps://t.me/{name}?start=invite_{code}')
 
     def admit(self, uid, code):
         if uid in self.admins or self.store.user(uid):
@@ -1169,6 +1214,8 @@ class AIChat:
                 raise ValueError('Приглашение недействительно или истекло.')
             c.execute('UPDATE invites SET uses=uses-1 WHERE code=?', (hashed,))
             c.execute('INSERT OR IGNORE INTO admitted VALUES(?)', (uid,))
+            expires = now() + invite['days'] * 86400 if invite['days'] else 0
+            c.execute('INSERT OR IGNORE INTO subscriptions(id,expires,blocked) VALUES(?,?,0)', (uid, expires))
 
     def export(self, uid):
         if uid not in self.admins:
@@ -1206,6 +1253,9 @@ class AIChat:
                 elif command == '/invite':
                     self.invite(uid)
                     return
+                elif command == '/subscription':
+                    self.subscription_info(uid)
+                    return
                 elif command == '/help':
                     self.tell(uid, 'AI Chat\n/start — кабинет\n/new — новый чат\n/cancel — отменить ввод\n/stop — остановить запрос\n\nФото: добавь вопрос в подпись. Файлы: PDF/DOCX/XLSX/TXT/MD/CSV/JSON. Голос работает при поддержке /audio/transcriptions у панели. Озвучка — /audio/speech. Это отдельные платные запросы API.')
                 self.home(uid)
@@ -1238,6 +1288,8 @@ class AIChat:
                     return
                 if uid in self.jobs and action not in ('home', 'usage'):
                     raise ValueError('Дождись ответа или нажми «Стоп», прежде чем менять настройки.')
+                if action not in ('confirmrestore', 'confirmcleardb', 'confirmrevoke'):
+                    self.states.pop(uid, None)
                 if action == 'home':
                     self.home(uid)
                 elif action == 'panels':
@@ -1377,8 +1429,49 @@ class AIChat:
                     self.tell(uid, 'Выход выполнен. /start — войти.')
                 elif action == 'admin':
                     self.admin_menu(uid)
+                elif action == 'subscription':
+                    self.subscription_info(uid)
+                elif action in ('friends', 'friendpage'):
+                    self.states.pop(uid, None)
+                    self.friends(uid, int(parts[1]) if action == 'friendpage' else 0)
+                elif action == 'addfriend':
+                    if uid not in self.admins:
+                        raise ValueError('Нужны права администратора.')
+                    self.states[uid] = {'step': 'friend_id'}
+                    self.tell(uid, 'Отправь числовой Telegram ID друга. Он увидит свой ID в «🎟 Мой доступ». /cancel — отмена.')
+                elif action == 'friend':
+                    self.friend_card(uid, int(parts[1]))
+                elif action == 'grant':
+                    if uid not in self.admins:
+                        raise ValueError('Нужны права администратора.')
+                    friend, duration = int(parts[1]), int(parts[2])
+                    if friend in self.admins:
+                        raise ValueError('Администратору подписка не требуется.')
+                    self.store.grant_subscription(friend, duration)
+                    self.friend_card(uid, friend)
+                elif action == 'revokefriend':
+                    if uid not in self.admins:
+                        raise ValueError('Нужны права администратора.')
+                    friend = int(parts[1])
+                    if friend <= 0 or friend in self.admins:
+                        raise ValueError('Нельзя отключить доступ администратору.')
+                    self.states[uid] = {'step': 'revoke_friend', 'friend': friend, 'expires': now() + 300}
+                    self.card(uid, 'Отключить доступ?', f'Друг {friend} больше не сможет отправлять запросы к ИИ. Его панели и история сохранятся.',
+                              keyboard([btn('⛔ Отключить', 'confirmrevoke', 'danger'), btn('Отмена', 'friends')]))
+                elif action == 'confirmrevoke':
+                    state = self.states.get(uid, {})
+                    if uid not in self.admins or state.get('step') != 'revoke_friend' or state.get('expires', 0) < now():
+                        raise ValueError('Подтверждение истекло.')
+                    friend = state['friend']
+                    with self.lock:
+                        self.store.write('INSERT INTO subscriptions(id,expires,blocked) VALUES(?,0,1) '
+                                         'ON CONFLICT(id) DO UPDATE SET blocked=1', (friend,))
+                        if friend in self.jobs:
+                            self.jobs[friend].cancel.set()
+                    self.states.pop(uid, None)
+                    self.friend_card(uid, friend)
                 elif action == 'invite':
-                    self.invite(uid)
+                    self.invite(uid, int(parts[1]) if len(parts) > 1 else None)
                 elif action == 'backup':
                     self.export(uid)
                 elif action == 'restore':
@@ -1445,6 +1538,9 @@ class AIChat:
         auth_steps = ('register', 'register_confirm', 'login', 'old_password', 'new_password', 'new_password_confirm', 'import_password', 'clear_password')
         if step in auth_steps and message.content_type == 'text':
             self.erase(message)
+            if step == 'clear_password' and state.get('expires', 0) < now():
+                self.states.pop(uid, None)
+                raise ValueError('Подтверждение очистки истекло. База не изменена.')
             if step not in ('register', 'register_confirm', 'login') and not self.authenticated(uid):
                 self.gate(uid)
                 return
@@ -1517,6 +1613,8 @@ class AIChat:
             '⚙️ Настройки': 'settings',
             '🛠 Админка · доступы': 'admin',
             '🛠 Админка': 'admin',  # Older reply keyboard label.
+            '🎟 Мой доступ': 'subscription',
+            '👥 Друзья и подписки': 'friends',
         }
         if text in nav:
             self.states.pop(uid, None)
@@ -1524,7 +1622,15 @@ class AIChat:
             call = type('LocalCall', (), {'id': '', 'from_user': message.from_user, 'message': message, 'data': nav[text]})()
             self.callback(call)
             return
-        if step == 'panel_name':
+        if step == 'friend_id':
+            if uid not in self.admins:
+                raise ValueError('Нужны права администратора.')
+            if not text.strip().isdigit() or int(text.strip()) <= 0 or len(text.strip()) > 18:
+                raise ValueError('Отправь положительный числовой Telegram ID.')
+            friend = int(text.strip())
+            self.states.pop(uid, None)
+            self.friend_card(uid, friend)
+        elif step == 'panel_name':
             if not text.strip() or len(text) > 60:
                 raise ValueError('Название: 1–60 символов.')
             self.states[uid] = {'step': 'panel_url', 'name': text.strip()}
