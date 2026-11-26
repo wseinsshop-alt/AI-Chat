@@ -918,10 +918,6 @@ class AIChat:
             chunk = html.escape(text[pos:pos + 1800])
             chunk = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', chunk)
             self.bot.send_message(uid, chunk, parse_mode='HTML')
-        self.card(uid, '✨ Готово', 'Что сделать с ответом?', keyboard(
-            [btn('Короче', f'rewrite:short:{cid}'), btn('Подробнее', f'rewrite:long:{cid}'), btn('Проще', f'rewrite:simple:{cid}')],
-            [btn('↻ Повторить', f'retry:{cid}'), btn('🔊 Озвучить', f'speak:{cid}')],
-            [btn('📄 Скачать', f'saveformats:{cid}', 'success'), btn('💬 Чаты', 'chats')]))
 
     def generation(self, uid, job, content, cid=None, fmt=None, retry=False):
         chat = self.owned_chat(uid, cid) if cid else self.store.chat(uid)
