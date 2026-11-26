@@ -40,6 +40,9 @@ from telebot import types
 from cryptography.fernet import Fernet
 from PIL import Image, ImageOps
 from pypdf import PdfReader
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.dml.color import RGBColor
 from docx import Document
 from openpyxl import Workbook, load_workbook
 from reportlab.lib import colors
@@ -49,7 +52,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 
 ROOT = Path(__file__).resolve().parent
-FORMATS = ('pdf', 'docx', 'xlsx', 'txt', 'md', 'csv')
+FORMATS = ('pdf', 'docx', 'xlsx', 'txt', 'md', 'csv', 'pptx', 'json', 'html', 'zip')
 DEFAULTS = {'invite_only': True, 'session_hours': 24, 'backup_hours': 24,
             'backup_keep': 7, 'daily_tokens': 100000, 'daily_usd': 0,
             'max_output_tokens': 4096, 'history_messages': 20, 'max_file_mb': 10,
@@ -547,27 +550,85 @@ def photo_buffer(raw):
 
 
 def requested_output(text):
-    """Explicit output requests only; ordinary questions stay in the text chat."""
-    image = re.match(r'(?is)^\s*(?:нарисуй(?:те)?|изобрази(?:те)?|draw\b|'
-                     r'(?:создай|сгенерируй|сделай)\s+(?:мне\s+)?(?:картинку|изображение|фото|иллюстрацию)|'
-                     r'(?:create|generate)\s+(?:an?\s+)?image\b)', text)
-    if image:
-        return 'image'
-    document = re.search(r'(?i)\b(pdf|пдф(?:ку|ке|чик|чиком)?|docx|doc|word|ворд|'
-                         r'xlsx|xls|excel|эксель|txt|csv|markdown|md)\b', text)
+    """Explicit format wins over media mentioned inside the document request."""
     intent = re.search(r'(?i)\b(?:сделай|создай|сформируй|сгенерируй|подготовь|'
                        r'пришли|пришлите|скинь|скиньте|сбрось|сохрани|сохраните|'
                        r'оформи|отправь|отправьте|выгрузи|экспортируй|'
                        r'create|send|save|export|make)\b', text)
+    document = re.search(r'(?i)\b(pdf|пдф(?:ку|ке|чик|чиком)?|docx|doc|word|ворд|'
+                         r'xlsx|xls|excel|эксель|txt|csv|markdown|md|pptx|ppt|powerpoint|'
+                         r'паверпоинт|поверпоинт|json|html|zip|зип)\b', text)
     if document and intent:
+        mentions = list(document.re.finditer(text))
+        if any(re.fullmatch(r'\s*(?:,|и|и ещё|а также)\s*(?:в\s+)?', text[left.end():right.start()], re.I)
+               for left, right in zip(mentions, mentions[1:])):
+            return None  # Let the structured file protocol return all requested formats.
         kind = document.group(1).lower()
         if kind.startswith('пдф'):
             return 'pdf'
         return {'doc': 'docx', 'word': 'docx', 'ворд': 'docx', 'xls': 'xlsx',
-                'excel': 'xlsx', 'эксель': 'xlsx', 'markdown': 'md'}.get(kind, kind)
-    if intent and re.search(r'(?i)\bфайлом\b', text):
-        return 'txt'
+                'excel': 'xlsx', 'эксель': 'xlsx', 'markdown': 'md',
+                'ppt': 'pptx', 'powerpoint': 'pptx', 'паверпоинт': 'pptx',
+                'поверпоинт': 'pptx', 'зип': 'zip'}.get(kind, kind)
+    if re.match(r'(?is)^\s*(?:нарисуй(?:те)?|изобрази(?:те)?|draw\b|'
+                r'(?:создай|сгенерируй|сделай|пришли|отправь|скинь)\s+(?:мне\s+)?'
+                r'(?:картинку|изображение|фото(?:графию|графии|чку)?|фотку|иллюстрацию|рисунок)|'
+                r'(?:create|generate)\s+(?:an?\s+)?image\b)', text):
+        return 'image'
+    if intent:
+        if re.search(r'(?i)\bпрезентаци[яюи]\b', text):
+            return 'pptx'
+        if re.search(r'(?i)\b(?:таблицу|табличку)\b', text):
+            return 'xlsx'
+        if re.search(r'(?i)\b(?:архив|архивом)\b', text):
+            return 'zip'
+        if re.search(r'(?i)\bдокумент(?:ом)?\b', text):
+            return 'pdf'
+        if re.search(r'(?i)\b(?:файлом|файл)\b', text):
+            return 'txt'
     return None
+
+
+def clean_json(text):
+    return re.sub(r'^' + r'\x60{3}(?:json)?\s*|\s*\x60{3}$', '', text.strip())
+
+
+def artifact_name(name, fmt):
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_', str(name or 'AI-Chat'))
+    name = name.strip(' .')[:100] or 'AI-Chat'
+    stem = name.rsplit('.', 1)[0] if '.' in name else name
+    return stem + '.' + fmt
+
+
+def response_artifacts(text):
+    """Decode file declarations as data only; never run generated code."""
+    files = []
+    def extract(match):
+        payload = json.loads(match.group(1))
+        items = payload.get('files') if isinstance(payload, dict) else None
+        if not isinstance(items, list) or not 1 <= len(items) <= 4:
+            raise ValueError('Модель должна вернуть от 1 до 4 файлов.')
+        for item in items:
+            if isinstance(item, dict) and isinstance(item.get('format'), str):
+                item['format'] = item['format'].lower()
+            if not isinstance(item, dict) or item.get('format') not in FORMATS:
+                raise ValueError('Модель запросила неподдерживаемый формат файла.')
+            content = item.get('content')
+            if isinstance(content, (dict, list)):
+                content = json.dumps(content, ensure_ascii=False)
+            if not isinstance(content, str) or len(content) > 120000:
+                raise ValueError('Модель вернула слишком большое или неверное содержимое файла.')
+            files.append((artifact_name(item.get('name'), item['format']), item['format'], content))
+        if len(files) > 4 or sum(len(f[2]) for f in files) > 120000:
+            raise ValueError('Слишком много файлов или текста в одном ответе.')
+        return ''
+    try:
+        visible = re.sub(r'(?s)\x60{3}ai-files\s*\n(.*?)\n\x60{3}', extract, text)
+    except (json.JSONDecodeError, TypeError):
+        raise ValueError('Ответ с файлами обрезан или имеет неверный JSON. Попроси модель выдать файл ещё раз.') from None
+    if re.search(r'\x60{3}ai-files\b', visible):
+        raise ValueError('Модель не закончила описание файлов. Попроси уменьшить объём или увеличить лимит ответа.')
+    return visible.strip(), files
 
 
 def check_zip(raw):
@@ -607,13 +668,27 @@ def read_document(raw, name):
                         break
         finally:
             book.close()
-    elif ext in ('.txt', '.md', '.csv', '.json'):
+    elif ext == '.pptx':
+        check_zip(raw)
+        deck = Presentation(io.BytesIO(raw))
+        if len(deck.slides) > 60:
+            raise ValueError('Лимит — 60 слайдов PPTX.')
+        for index, slide in enumerate(deck.slides, 1):
+            parts.append('Слайд ' + str(index))
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    parts.append(shape.text)
+                elif shape.has_table:
+                    parts.extend(' | '.join(cell.text for cell in row.cells) for row in shape.table.rows)
+            if sum(map(len, parts)) > 60000:
+                break
+    elif ext in ('.txt', '.md', '.csv', '.json', '.html'):
         try:
             parts = [raw.decode('utf-8-sig')]
         except UnicodeDecodeError:
             parts = [raw.decode('cp1251')]
     else:
-        raise ValueError('Поддерживаются PDF, DOCX, XLSX, TXT, MD, CSV, JSON и изображения.')
+        raise ValueError('Поддерживаются PDF, DOCX, XLSX, PPTX, TXT, MD, CSV, JSON, HTML и изображения.')
     text = '\n'.join(parts)
     if not text.strip():
         raise ValueError('В документе нет текста. Скан PDF пришли фотографией.')
@@ -668,6 +743,77 @@ def create_document(text, fmt):
             sheet.column_dimensions[col[0].column_letter].width = min(50, max(12, max(len(str(c.value or '')) for c in col) + 2))
         book.save(out)
         book.close()
+    elif fmt == 'json':
+        value = json.loads(clean_json(text))
+        out.write(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False).encode())
+    elif fmt == 'html':
+        paragraphs = '\n'.join('<p>' + html.escape(line) + '</p>' for line in text.splitlines())
+        out.write(('<!doctype html><html lang="ru"><meta charset="utf-8"><title>AI Chat</title>'
+                   '<style>body{max-width:900px;margin:40px auto;padding:24px;font:18px/1.6 sans-serif}'
+                   'p{white-space:pre-wrap;overflow-wrap:anywhere}</style><body>' +
+                   paragraphs + '</body></html>').encode())
+    elif fmt == 'zip':
+        bundle = json.loads(clean_json(text))
+        items = bundle.get('files') if isinstance(bundle, dict) else None
+        if not isinstance(items, list) or not 1 <= len(items) <= 20:
+            raise ValueError('Для ZIP нужны от 1 до 20 текстовых файлов в JSON.')
+        seen, size = set(), 0
+        with zipfile.ZipFile(out, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+            for item in items:
+                if not isinstance(item, dict):
+                    raise ValueError('Некорректная запись файла в архиве.')
+                name, content = item.get('name'), item.get('content')
+                if (not isinstance(name, str) or not name.strip(' .') or name in ('.', '..')
+                        or re.search(r'[\\/:*?"<>|\x00-\x1f]', name) or len(name) > 100
+                        or name.casefold() in seen or not isinstance(content, str)):
+                    raise ValueError('В архиве нужны уникальные простые имена и текстовое содержимое.')
+                size += len(content.encode())
+                if size > 1024 * 1024:
+                    raise ValueError('Слишком большой архив.')
+                seen.add(name.casefold())
+                archive.writestr(name, content)
+    elif fmt == 'pptx':
+        try:
+            payload = json.loads(clean_json(text))
+            slides = payload.get('slides') if isinstance(payload, dict) else None
+        except json.JSONDecodeError:
+            chunks = re.split(r'\n(?=#{1,2}\s)', text)
+            slides = [{'title': chunk.splitlines()[0].lstrip('# ').strip()[:80],
+                       'points': [line.lstrip('-* ').strip() for line in chunk.splitlines()[1:] if line.strip()][:6]}
+                      for chunk in chunks if chunk.strip()]
+        if not isinstance(slides, list) or not 1 <= len(slides) <= 20:
+            raise ValueError('Для PPTX нужны от 1 до 20 слайдов.')
+        deck = Presentation()
+        deck.slide_width, deck.slide_height = Inches(13.333), Inches(7.5)
+        for index, item in enumerate(slides, 1):
+            if not isinstance(item, dict):
+                raise ValueError('Некорректное содержимое слайда.')
+            title, points = item.get('title', ''), item.get('points', [])
+            if not isinstance(title, str) or not isinstance(points, list) or len(points) > 6:
+                raise ValueError('На слайде нужен заголовок и до 6 пунктов.')
+            if any(not isinstance(p, str) or len(p) > 180 for p in points) or len(title) > 100:
+                raise ValueError('Сократи текст презентации: заголовок до 100, пункт до 180 символов.')
+            slide = deck.slides.add_slide(deck.slide_layouts[6])
+            slide.background.fill.solid()
+            slide.background.fill.fore_color.rgb = RGBColor.from_string('F4F7FC')
+            head = slide.shapes.add_textbox(Inches(.7), Inches(.6), Inches(11.9), Inches(1.2)).text_frame
+            head.word_wrap = True
+            head.text = title
+            head.paragraphs[0].font.size = Pt(30)
+            head.paragraphs[0].font.bold = True
+            head.paragraphs[0].font.color.rgb = RGBColor.from_string('1746A2')
+            body = slide.shapes.add_textbox(Inches(.8), Inches(2), Inches(11.6), Inches(4.6)).text_frame
+            body.word_wrap = True
+            for i, point in enumerate(points):
+                p = body.paragraphs[0] if i == 0 else body.add_paragraph()
+                p.text = '• ' + point
+                p.font.size = Pt(21)
+                p.space_after = Pt(18)
+                p.font.color.rgb = RGBColor.from_string('243247')
+            footer = slide.shapes.add_textbox(Inches(.8), Inches(7), Inches(11), Inches(.3)).text_frame
+            footer.text = f'AI CHAT  ·  {index:02d}'
+            footer.paragraphs[0].font.size = Pt(10)
+        deck.save(out)
     elif fmt == 'docx':
         doc = Document()
         for line in text.splitlines():
@@ -940,7 +1086,7 @@ class AIChat:
 
     def help_menu(self, uid):
         self.card(uid, '❔ Как пользоваться',
-                  'ОБЩЕНИЕ\nВыбери панель и модель, затем просто пиши. Для фотографии добавь вопрос в подпись. Можно прислать PDF, DOCX, XLSX, TXT, MD, CSV или JSON.\n\nДОКУМЕНТЫ\nОткрой «Документы», выбери формат и опиши, что создать.\n\nУПРАВЛЕНИЕ\n/menu — меню · /new — новый чат\n/stop — остановить · /cancel — отменить настройку\n\nВыданные панели используют баланс владельца, история чатов у каждого своя. Голосовые распознаются, ответ приходит текстом. «Нарисуй…» создаёт картинку через модель изображений. Поддержка фото, голоса и картинок зависит от API-панели.',
+                  'ОБЩЕНИЕ\nВыбери панель и модель, затем просто пиши. Для фотографии добавь вопрос в подпись. Можно прислать PDF, DOCX, XLSX, PPTX, TXT, MD, CSV, JSON или HTML.\n\nДОКУМЕНТЫ\nОткрой «Документы» или просто попроси файл. Доступны PDF, Word, Excel, PowerPoint, TXT, MD, CSV, JSON, HTML и ZIP. Можно попросить несколько файлов.\n\nУПРАВЛЕНИЕ\n/menu — меню · /new — новый чат\n/stop — остановить · /cancel — отменить настройку\n\nВыданные панели используют баланс владельца, история чатов у каждого своя. Голосовые распознаются, ответ приходит текстом. «Нарисуй…» создаёт картинку через модель изображений. Поддержка фото, голоса и картинок зависит от API-панели.',
                   keyboard([btn('💬 К общению', 'resume'), btn('📄 Документы', 'formats')],
                            [btn('📚 Панели', 'panels'), btn('🏠 Меню', 'home')]))
 
@@ -1296,10 +1442,26 @@ class AIChat:
             instruction += f' Пользователь запросил настоящий файл {fmt}. Приложение само создаст и прикрепит его в Telegram из твоего ответа. Подготовь только содержимое документа. Не пиши, что не можешь прикрепить файл, не обещай ссылку и не давай инструкций самостоятельного сохранения.'
             if fmt == 'xlsx':
                 instruction += ' Верни только JSON-массив строк таблицы: [["Заголовок"],["Значение"]], без ограждений.'
+            elif fmt == 'pptx':
+                instruction += ' Верни только JSON {"slides":[{"title":"Заголовок","points":["Пункт"]}]}. До 20 слайдов, до 6 пунктов по 180 символов на слайд, заголовок до 100 символов.'
+            elif fmt == 'zip':
+                instruction += ' Верни только JSON {"files":[{"name":"notes.txt","content":"Текст"}]}. До 20 файлов, простые имена без путей, только текстовое содержимое.'
+            elif fmt == 'json':
+                instruction += ' Верни только корректный JSON без ограждений и объяснений.'
             elif fmt == 'csv':
                 instruction += ' Верни только CSV с заголовком.'
             else:
                 instruction += ' Используй простые заголовки и абзацы. Не используй широкие Markdown-таблицы.'
+        else:
+            instruction += (
+                ' Приложение умеет создавать настоящие PDF, DOCX, XLSX, TXT, MD, CSV, PPTX, JSON, HTML и ZIP.'
+                ' Если пользователь просит файл, не утверждай, что не можешь прикреплять файлы: выдай содержимое в блоке '
+                '```ai-files\n{"files":[{"name":"document.pdf","format":"pdf","content":"Текст документа"}]}\n```.'
+                ' До четырёх файлов, только перечисленные форматы, content — строка или JSON.'
+                ' Для XLSX content — массив строк, для PPTX объект slides с title и points (до 20 слайдов, 6 коротких пунктов),'
+                ' для ZIP объект files с name и текстовым content (до 20 простых имён без путей).'
+                ' Пиши обычный ответ вне блока; не выдавай этот блок, если пользователь не просил файл.'
+                ' Картинки создаются приложением отдельной функцией; не выдумывай ссылки на несуществующие вложения.')
         messages = [{'role': 'system', 'content': instruction}] + history + [{'role': 'user', 'content': content}]
         # UTF-8 bytes are a conservative text-token reservation, not an exact tokenizer.
         incoming_est = sum(len(json.dumps(x, ensure_ascii=False).encode()) if isinstance(x['content'], str)
@@ -1348,7 +1510,7 @@ class AIChat:
                         finish = choice.get('finish_reason') or finish
                     if len(answer) > 24 * 1024 * 1024:
                         raise ValueError('Ответ слишком большой; уменьши лимит генерации.')
-                    if now() - last_edit > 2 and answer and len(answer) < 120000 and 'data:image' not in answer:
+                    if now() - last_edit > 2 and answer and len(answer) < 120000 and 'data:image' not in answer and 'ai-files' not in answer:
                         try:
                             self.bot.edit_message_text('✦ ' + answer[-2800:], uid, status.message_id,
                                                        reply_markup=keyboard([btn('⏹ Стоп', 'stop', 'danger')]))
@@ -1368,18 +1530,31 @@ class AIChat:
             if markdown_images:
                 pictures.extend(markdown_images)
                 answer = re.sub(r'!\[[^\]]*\]\((https://[^\s)]+|data:image/[^)\s]+)\)', '', answer).strip()
-            if not answer.strip() and not pictures:
+            answer, artifacts = response_artifacts(answer)
+            prepared_files = []
+            for name, kind, data in artifacts:
+                file = create_document(data, kind)
+                file.name = name
+                prepared_files.append(file)
+            if not answer.strip() and not pictures and not prepared_files:
                 raise ValueError('Модель не вернула текст или изображение. Проверь модель и режим потока панели.')
             if len(answer) > 120000:
                 raise ValueError('Ответ слишком большой; уменьши лимит генерации.')
             stored_answer = answer + ('\n[Изображение от ИИ]' if pictures else '')
+            if artifacts:
+                stored_answer += '\n[Файлы: ' + ', '.join(item[0] for item in artifacts) + ']\n'
+                stored_answer += '\n'.join(item[2] for item in artifacts)
             self.store.append(chat['id'], content, stored_answer)
             if chat['title'] == 'Новый чат':
                 title = content if isinstance(content, str) else content[0].get('text', 'Изображение')
                 self.store.write('UPDATE chats SET title=? WHERE id=? AND owner=?', (title[:50], chat['id'], uid))
+            for file in prepared_files:
+                if job.cancel.is_set():
+                    raise Cancelled()
+                self.bot.send_document(uid, file, caption='📎 ' + file.name)
             if pictures:
                 self.send_pictures(uid, job, pictures)
-            if fmt and answer.strip():
+            if fmt and answer.strip() and not prepared_files:
                 caption = '📎 AI Chat · ' + fmt.upper()
                 if fmt in ('pdf', 'docx', 'txt', 'md') and len(answer) <= 800:
                     caption += '\n\n' + answer
@@ -1414,7 +1589,7 @@ class AIChat:
         for i in range(0, len(FORMATS), 2):
             buttons.append([btn(fmt.upper(), f'{prefix}:{fmt}' + (f':{cid}' if cid else '')) for fmt in FORMATS[i:i + 2]])
         buttons.append([btn('❔ Помощь', 'help'), btn('🏠 Меню', 'home')])
-        self.card(uid, '📄 Создать документ', 'Скачать последний ответ этого чата.' if cid else 'PDF — для чтения · DOCX — для Word\nXLSX — таблица · CSV — данные\nTXT и MD — простой текст\n\nВыбери формат, затем опиши содержимое.', keyboard(*buttons))
+        self.card(uid, '📄 Создать документ', 'Скачать последний ответ этого чата.' if cid else 'PDF и DOCX — документы\nXLSX и CSV — таблицы · PPTX — презентации\nTXT и MD — текст · JSON — данные\nHTML — статическая страница · ZIP — архив текстов\n\nВыбери формат, затем опиши содержимое.', keyboard(*buttons))
 
     def download(self, obj):
         limit = min(19, int(self.cfg['max_file_mb'])) * 1024 * 1024
