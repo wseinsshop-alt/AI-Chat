@@ -160,6 +160,7 @@ CREATE TABLE IF NOT EXISTS panel_shares(panel INTEGER NOT NULL REFERENCES panels
 CREATE TABLE IF NOT EXISTS preferences(owner INTEGER PRIMARY KEY,style TEXT NOT NULL DEFAULT 'balanced');
 CREATE TABLE IF NOT EXISTS panel_choices(owner INTEGER NOT NULL,panel INTEGER NOT NULL REFERENCES panels(id) ON DELETE CASCADE,
  model TEXT NOT NULL,PRIMARY KEY(owner,panel));
+CREATE TABLE IF NOT EXISTS ui_sessions(owner INTEGER PRIMARY KEY,payload TEXT NOT NULL,expires REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS admitted(id INTEGER PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS subscriptions(id INTEGER PRIMARY KEY,expires REAL NOT NULL DEFAULT 0,
  blocked INTEGER NOT NULL DEFAULT 0);
@@ -365,6 +366,7 @@ class Store:
         self.automatic_backup(force=True)
         with self.db() as c:
             c.execute('DELETE FROM reservations')
+            c.execute('DELETE FROM ui_sessions')
             for table in reversed(self.TABLES):
                 c.execute('DELETE FROM ' + table)
             for table in self.TABLES:
@@ -377,6 +379,7 @@ class Store:
         self.automatic_backup(force=True)
         with self.db() as c:
             c.execute('DELETE FROM reservations')
+            c.execute('DELETE FROM ui_sessions')
             for table in reversed(self.TABLES):
                 c.execute('DELETE FROM ' + table)
             if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history'").fetchone():
@@ -444,14 +447,24 @@ class Provider:
         r = self.request(path, payload)
         try:
             raw = bounded_response(r, 10 * 1024 * 1024)
-            return json.loads(raw)
+            try:
+                return json.loads(raw)
+            except (ValueError,UnicodeError):
+                raise ValueError('Панель вернула не JSON. Проверь именно API base URL, а не адрес страницы чата.') from None
         finally:
             r.close()
             r._ai_session.close()
 
     def model_records(self):
-        found = self.json('/models').get('data', [])
-        return [m for m in found if isinstance(m,dict) and isinstance(m.get('id'),str) and m['id'].strip()]
+        result = self.json('/models')
+        found = result.get('data') if isinstance(result,dict) else None
+        if not isinstance(found,list):
+            raise ValueError('API не вернул список моделей data. Проверь совместимость панели и API-адрес.')
+        unique = {}
+        for m in found:
+            if isinstance(m,dict) and isinstance(m.get('id'),str) and m['id'].strip():
+                unique.setdefault(m['id'],m)
+        return list(unique.values())
 
     def models(self):
         found = self.model_records()
@@ -957,7 +970,7 @@ class AIChat:
         self.admins = set(map(int, config['admin_ids']))
         self.store.admin_ids = self.admins
         self.reply_routes = {}
-        self.reply_labels = set()
+        self.reply_labels = {}
         self.catalog_cache = {}
         self.states = {}
         self.cache = {}
@@ -974,21 +987,84 @@ class AIChat:
 
     @staticmethod
     def model_label(model):
-        raw = str(model or '').strip()
+        raw = readable_name(model)
         name = raw.rsplit('/',1)[-1]
         families = {'gpt':'GPT','chatgpt':'ChatGPT','claude':'Claude','gemini':'Gemini',
                     'deepseek':'DeepSeek','qwen':'Qwen','llama':'Llama','mistral':'Mistral'}
+        known = False
         for prefix, label in families.items():
             if re.match(r'^'+prefix+r'(?=[\d_.-]|$)',name,re.I):
                 name = label + name[len(prefix):]
+                known = True
                 break
-        else:
-            name = raw
-        name = re.sub(r'(?i):free$', ' · Free', name)
-        name = name.replace('_',' ').replace('-',' ')
-        for word in ('mini','nano','flash','pro','sonnet','haiku','opus','instruct','vision','preview'):
-            name = re.sub(r'(?i)\b'+word+r'\b',word.capitalize(),name)
-        return re.sub(r'\s+',' ',name).strip() or 'Не выбрана'
+        if not known:
+            return raw or 'Не выбрана'
+        # Only Claude's documented short version notation; never rewrite date suffixes.
+        if name.startswith('Claude'):
+            name = re.sub(r'(?<=-)(\d)-(\d)(?=-(?:sonnet|haiku|opus)|$)',r'\1.\2',name,flags=re.I)
+        for word in ('mini','nano','flash','pro','sonnet','haiku','opus','vision','vl','preview'):
+            name = re.sub(r'(?i)(?<!\w)'+word+r'(?!\w)',word.upper() if word=='vl' else word.capitalize(),name)
+        return name
+
+    @staticmethod
+    def compact_label(value, limit=90):
+        value = readable_name(value)
+        if len(value)<=limit:
+            return value
+        return value[:limit-26]+'…'+value[-25:]
+
+    @staticmethod
+    def panel_labels(panels):
+        result = {}
+        groups = {}
+        for p in panels:
+            groups.setdefault(readable_name(p['name']) or 'Панель',[]).append(p)
+        for name, group in groups.items():
+            group.sort(key=lambda p:p['id'])
+            hosts = [urlsplit(p['url']).hostname or '' for p in group]
+            for i,p in enumerate(group):
+                label = name
+                if len(group)>1:
+                    if len(set(hosts))==len(hosts):
+                        label += ' · '+hosts[i]
+                    elif i==0:
+                        label += ' · основная'
+                    else:
+                        label += ' · резерв '+chr(ord('А')+i-1)
+                result[p['id']] = label
+        return result
+
+    def load_routes(self, uid):
+        if uid not in self.reply_routes:
+            row = self.store.one('SELECT payload FROM ui_sessions WHERE owner=?',(uid,))
+            try:
+                routes = json.loads(row['payload']) if row else {}
+                if not isinstance(routes,dict) or any(not isinstance(k,str) or not isinstance(v,str) for k,v in routes.items()):
+                    routes = {}
+            except (ValueError,TypeError):
+                routes = {}
+            self.reply_routes[uid] = routes
+            self.reply_labels.setdefault(uid,set()).update(routes)
+        return self.reply_routes[uid]
+
+    def select_model(self, uid, pid, model):
+        if not self.store.panel(uid,pid):
+            raise ValueError('Доступ к этой панели отозван.')
+        if not model or len(model)>1000:
+            raise ValueError('Неверное название модели.')
+        u = self.store.user(uid)
+        old = self.store.one('SELECT * FROM chats WHERE id=? AND owner=?',(u['current_chat'],uid))
+        if old and not self.store.panel(uid,old['panel']):
+            old = None
+        with self.store.db() as c:
+            c.execute('UPDATE users SET active=? WHERE id=?',(pid,uid))
+            c.execute('INSERT INTO panel_choices VALUES(?,?,?) ON CONFLICT(owner,panel) DO UPDATE SET model=excluded.model',(uid,pid,model))
+            if old:
+                c.execute('UPDATE chats SET panel=?,model=?,updated=? WHERE id=? AND owner=?',(pid,model,now(),old['id'],uid))
+        if not old:
+            chat = self.store.new_chat(uid)
+            self.store.write('UPDATE chats SET model=? WHERE id=?',(model,chat['id']))
+        self.resume(uid)
 
     def tell(self, uid, text, keys=None, title=None):
         step = self.states.get(uid, {}).get('step')
@@ -1021,29 +1097,41 @@ class AIChat:
         return keyboard(*rows)
 
     def bottom(self, uid, keys=None):
+        with self.lock:
+            lock = self.user_locks.setdefault(uid,threading.RLock())
+        with lock:
+            return self._bottom(uid,keys)
+
+    def _bottom(self, uid, keys=None):
         keys = keys or self.main_keys(uid)
         items = [item for row in keys.to_dict().get('inline_keyboard',[]) for item in row
                  if item.get('callback_data') not in ('home','stop')]
-        items.append({'text':'🏠 Меню','callback_data':'home','style':'primary'})
-        items.append({'text':'⏹ Стоп','callback_data':'stop','style':'danger'})
-        if len(items)%2:
-            items.append({'text':'❔ Подсказка','callback_data':'help','style':'primary'})
-        routes, used = {}, set()
-        board = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True,
-                                         row_width=2, input_field_placeholder='Сообщение, фото или голосовое…')
-        buttons = []
+        items += [{'text':'🏠 Меню','callback_data':'home','style':'primary'},
+                  {'text':'⏹ Стоп','callback_data':'stop','style':'danger'}]
+        routes, buttons = {}, []
         for item in items:
-            label = item['text']
-            if label in used:
-                label += ' · ' + str(len(routes)+1)
-            used.add(label)
-            routes[label] = item['callback_data']
+            label = readable_name(item['text'])
+            if label and label[0].isalnum():
+                label = '› '+label
+            action = item['callback_data']
+            if label in routes:
+                if routes[label]==action:
+                    continue
+                raise ValueError('Повтор названия кнопки. Открой /start и обнови список.')
+            routes[label] = action
             buttons.append(types.KeyboardButton(label,style=item.get('style','primary')))
-            if len(buttons)==2:
-                board.row(*buttons)
-                buttons = []
+        if len(buttons)%2:
+            label = '❔ Как пользоваться'
+            routes[label] = 'help'
+            buttons.append(types.KeyboardButton(label,style='primary'))
+        board = types.ReplyKeyboardMarkup(resize_keyboard=True,is_persistent=True,row_width=2,
+                                         input_field_placeholder='Сообщение, фото или голосовое…')
+        for i in range(0,len(buttons),2):
+            board.row(*buttons[i:i+2])
+        self.store.write('INSERT INTO ui_sessions VALUES(?,?,?) ON CONFLICT(owner) DO UPDATE SET payload=excluded.payload,expires=excluded.expires',
+                         (uid,json.dumps(routes,ensure_ascii=False),now()+7*86400))
         self.reply_routes[uid] = routes
-        self.reply_labels.update(routes)
+        self.reply_labels.setdefault(uid,set()).update(routes)
         return board
 
     @staticmethod
@@ -1143,23 +1231,17 @@ class AIChat:
         if uid not in self.admins:
             self.models(uid)
             return
-        panels = self.store.available_panels(uid)
-        current = self.store.panel(uid)
-        pages = max(1, math.ceil(len(panels) / 6))
-        page = max(0, min(page, pages-1))
-        buttons = []
-        for p in panels[page*6:page*6+6]:
-            selected = current and current['id'] == p['id']
-            buttons.append([btn(('✓ ' if selected else '') + p['name'][:24], f'panel:{p["id"]}',
-                                'success' if selected else 'primary'),
-                            btn('⚙️ Настроить' if p['owner'] == uid else '🤝 О панели', f'panelcfg:{p["id"]}')])
-        buttons += self.page_nav(page, pages, 'panelpage')
-        buttons += [[btn('✚ Своя панель', 'addpanel'), btn('🏠 Меню', 'home')]]
-        body = ('Личная — твой API-ключ. Выданная — доступ от администратора. Нажми название, чтобы выбрать панель.' if panels else
-                'Пока нет доступных панелей. Попроси администратора выдать доступ или добавь свою по API-ссылке и ключу.')
-        if current:
-            body = 'Выбрана: ' + current['name'] + '\n\n' + body
-        self.card(uid, f'📚 Панели · {page+1}/{pages}', body, keyboard(*buttons))
+        panels = self.store.rows('SELECT * FROM panels WHERE owner=? ORDER BY id',(uid,))
+        labels = self.panel_labels(panels)
+        pages = max(1,math.ceil(len(panels)/6))
+        page = max(0,min(page,pages-1))
+        choices = [btn('📚 '+self.compact_label(labels[p['id']]),f'panelcfg:{p["id"]}') for p in panels[page*6:page*6+6]]
+        rows = [choices[i:i+2] for i in range(0,len(choices),2)]
+        rows += self.page_nav(page,pages,'panelpage')
+        rows += [[btn('➕ Добавить панель','addpanel'),btn('‹ Админка','admin')]]
+        self.card(uid,f'📚 Панели · {page+1}/{pages}',
+                  'Нажми название для настройки. В разговоре выбирается только модель.' if panels else
+                  'Добавь первую панель: название, API-адрес и ключ.',keyboard(*rows))
 
     def panel_settings(self, uid, pid):
         if uid not in self.admins:
@@ -1213,40 +1295,70 @@ class AIChat:
         favs = {(r['panel'],r['model']) for r in self.store.rows('SELECT panel,model FROM favorites WHERE owner=?',(uid,))}
         visible = [e for e in cached['all'] if query.casefold() in (e[1]+' '+e[2]).casefold() and
                    (not favorites or (e[0],e[1]) in favs)]
-        visible.sort(key=lambda e: ((e[0],e[1]) not in favs,e[1].casefold(),e[0]))
+        visible = sorted(set(visible),key=lambda e:((e[0],e[1]) not in favs,e[1].casefold(),e[0]))
         cached.update(visible=visible,query=query,favorites=favorites,revision=secrets.token_hex(3))
         pages = max(1,math.ceil(len(visible)/6))
         page = max(0,min(page,pages-1))
-        rows = []
-        for i in range(page*6,min(len(visible),(page+1)*6)):
-            pid, model, source = visible[i]
-            rows.append([btn(f'{i+1}. 🧠 '+self.model_label(model)[:32]+' · '+source[:16],f'model:{cached["revision"]}:{i}'),
-                         btn('★ Убрать' if (pid,model) in favs else '☆ Сохранить',
-                             f'favorite:{cached["revision"]}:{i}',
-                             'success' if (pid,model) in favs else 'primary')])
+        aliases = self.panel_labels(panels)
+        display = {}
+        for pid,model,source in visible:
+            label = self.compact_label(self.model_label(model)+' · '+aliases.get(pid,source))
+            display.setdefault(label,[]).append((pid,model,source))
+        choices = []
+        active = self.store.panel(uid)
+        current = self.store.chat(uid) if active else None
+        for pid,model,source in visible[page*6:page*6+6]:
+            label = self.compact_label(self.model_label(model)+' · '+aliases.get(pid,source))
+            if len(display[label])>1:
+                label = model+' · '+aliases.get(pid,source)
+            selected = current and current['panel']==pid and current['model']==model
+            choices.append(btn(('✅ ' if selected else '🧠 ')+label,f'choose:{pid}:{model}',
+                               'success' if selected else 'primary'))
+        rows = [choices[i:i+2] for i in range(0,len(choices),2)]
         rows += self.page_nav(page,pages,'modelpage')
-        rows += [[btn('🔎 Поиск','searchmodel'),btn('⭐ Избранное','models:favorites')],
+        rows += [[btn('🔎 Найти модель','searchmodel'),btn('⭐ Избранное','models:favorites')],
                  [btn('📋 Все модели','models'),btn('🔄 Обновить','refreshmodels')]]
-        body = f'Доступно моделей: {len(visible)}. Выбери модель — панель подключится автоматически. Переписка останется в текущем личном чате.'
+        if current and current['model']:
+            marked = (current['panel'],current['model']) in favs
+            rows.append([btn('★ Убрать текущую' if marked else '☆ Сохранить текущую','favorite_current'),
+                         btn('💬 Продолжить','resume')])
+        body = 'Выбери модель. Источник указан после точки, разговор сохранится.'
+        if current:
+            body = 'Сейчас: '+self.model_label(current['model'])+'\n\n'+body
+        if not visible:
+            body = 'Список пуст. Попробуй другой поиск или обнови модели.'
         if not panels:
-            body = 'Нет разрешённых панелей. ' + ('Добавь их в админке.' if uid in self.admins else 'Попроси администратора выдать доступ.')
+            body = 'Нет разрешённых панелей. '+('Добавь панель в админке.' if uid in self.admins else 'Попроси администратора выдать доступ.')
         if cached['failed']:
-            body += '\nНедоступны: ' + ', '.join(cached['failed'])[:300] + '. Остальные модели доступны.'
-        self.card(uid,f'🧠 Все модели · {page+1}/{pages}',body,keyboard(*rows))
+            body += '\nВременно недоступны: '+', '.join(cached['failed'])[:300]
+        self.card(uid,f'🧠 Модели · {page+1}/{pages}',body,keyboard(*rows))
 
     def chats(self, uid, page=0):
-        all_chats = self.store.rows('SELECT c.*,p.name AS panel_name FROM chats c JOIN panels p ON p.id=c.panel WHERE c.owner=? ORDER BY c.updated DESC', (uid,))
-        all_chats = [c for c in all_chats if self.store.panel(uid, c['panel'])]
-        total = max(1, math.ceil(len(all_chats) / 6))
-        page = max(0, min(page, total-1))
-        buttons = [[btn(c['title'][:24], f'chat:{c["id"]}'),
-                    btn('⚙️ Настроить', f'chatcfg:{c["id"]}')] for c in all_chats[page*6:page*6+6]]
-        buttons += self.page_nav(page, total, 'chatpage')
-        buttons += [[btn('✚ Новый чат', 'newchat'), btn('🏠 Меню', 'home')]]
-        self.card(uid, f'🗂 Мои чаты · {page+1}/{total}',
-                  'Нажми название, чтобы продолжить. Настройки: название, история и удаление. Переписка видна только тебе.' if all_chats else
-                  'Здесь появится твоя переписка. Выбери панель и начни новый чат.',
-                  keyboard(*buttons))
+        chats = self.store.rows('SELECT * FROM chats WHERE owner=? ORDER BY updated DESC,id DESC',(uid,))
+        chats = [c for c in chats if self.store.panel(uid,c['panel'])]
+        pages = max(1,math.ceil(len(chats)/6))
+        page = max(0,min(page,pages-1))
+        titles = {}
+        for c in chats:
+            base = readable_name(c['title']) or 'Новый чат'
+            titles.setdefault(base,[]).append(c)
+        choices = []
+        for c in chats[page*6:page*6+6]:
+            title = readable_name(c['title']) or 'Новый чат'
+            if len(titles[title])>1:
+                title += ' · '+datetime.fromtimestamp(c['updated'],timezone.utc).strftime('%d.%m.%Y %H:%M:%S')
+                same = sorted(titles[readable_name(c['title']) or 'Новый чат'],key=lambda x:x['id'])
+                stamp = datetime.fromtimestamp(c['updated'],timezone.utc).strftime('%d.%m.%Y %H:%M:%S')
+                same_second = [x for x in same if datetime.fromtimestamp(x['updated'],timezone.utc).strftime('%d.%m.%Y %H:%M:%S')==stamp]
+                if len(same_second)>1:
+                    title += ' · '+chr(ord('А')+next(i for i,x in enumerate(same_second) if x['id']==c['id']))
+            choices.append(btn('💬 '+self.compact_label(title),f'chatcfg:{c["id"]}'))
+        rows = [choices[i:i+2] for i in range(0,len(choices),2)]
+        rows += self.page_nav(page,pages,'chatpage')
+        rows += [[btn('✚ Новый чат','newchat'),btn('💬 Продолжить','resume')]]
+        self.card(uid,f'💬 Мои чаты · {page+1}/{pages}',
+                  'Нажми чат: открыть, переименовать, скачать историю или удалить. История видна только тебе.' if chats else
+                  'Пока нет разговоров. Выбери модель и напиши первое сообщение.',keyboard(*rows))
 
     def owned_chat(self, uid, cid):
         chat = self.store.one('SELECT * FROM chats WHERE id=? AND owner=?', (cid, uid))
@@ -1452,6 +1564,9 @@ class AIChat:
                 self.store.write('UPDATE chats SET title=? WHERE id=? AND owner=?', (prompt[:50], chat['id'], uid))
             with self.menu_lock:
                 self.menu_ids.pop(uid, None)
+        except ProviderQuotaError:
+            started = False
+            raise
         finally:
             if response is not None:
                 response.close()
@@ -1751,6 +1866,9 @@ class AIChat:
                 raise ValueError('Не удалось распознать речь.')
             if job.cancel.is_set():
                 raise Cancelled()
+        except ProviderQuotaError:
+            started = False
+            raise
         finally:
             if response is not None:
                 response.close()
@@ -1802,7 +1920,7 @@ class AIChat:
             count = self.store.one('SELECT COUNT(*) AS n FROM panel_shares s JOIN panels p ON p.id=s.panel WHERE s.friend=? AND p.owner=?', (friend, uid))['n']
             buttons.append([btn(('🟢 ' if active else '⚪ ') + str(friend), f'friend:{friend}',
                                 'success' if active else 'primary'),
-                            btn(f'Панели · {count}', f'shares:{friend}')])
+                            btn(f'🤝 Панели {friend}', f'shares:{friend}')])
         buttons += self.page_nav(page, total, 'friendpage')
         buttons += [[btn('✚ Друг по ID', 'addfriend'), btn('🔗 Пригласить', 'invite')],
                     [btn('🔄 Обновить', f'friendpage:{page}'), btn('‹ Админка', 'admin')]]
@@ -1826,25 +1944,24 @@ class AIChat:
                            [btn('⛔ Отключить', f'revokefriend:{friend}', 'danger'), btn('‹ Админка', 'admin')]))
 
     def share_menu(self, uid, friend, page=0):
-        if uid not in self.admins or friend <= 0 or friend in self.admins:
+        if uid not in self.admins or friend<=0 or friend in self.admins:
             raise ValueError('Нужны права администратора и ID друга.')
-        panels = self.store.rows('SELECT * FROM panels WHERE owner=? ORDER BY id', (uid,))
-        pages = max(1, math.ceil(len(panels) / 6))
-        page = max(0, min(page, pages-1))
-        rows = []
+        panels = self.store.rows('SELECT * FROM panels WHERE owner=? ORDER BY id',(uid,))
+        aliases = self.panel_labels(panels)
+        pages = max(1,math.ceil(len(panels)/6))
+        page = max(0,min(page,pages-1))
+        choices = []
         for p in panels[page*6:page*6+6]:
-            granted = self.store.one('SELECT 1 FROM panel_shares WHERE panel=? AND friend=?', (p['id'], friend))
-            rows.append([btn(p['name'][:24], f'panelcfg:{p["id"]}'),
-                         btn('✓ Разрешена' if granted else '＋ Выдать', f'sharetoggle:{friend}:{p["id"]}:{page}',
-                             'success' if granted else 'primary')])
-        rows += self.page_nav(page, pages, f'shares:{friend}')
-        rows += [[btn('👤 Карточка друга', f'friend:{friend}'), btn('👥 Все друзья', 'friends')]]
-        active = self.store.has_subscription(friend)
-        body = ('Срок доступа: активен.' if active else '⚠ Сначала выдай срок доступа в карточке друга.')
-        body += '\n\nСправа: «Выдать» открывает панель; «Разрешена» отключает её. Слева: настройки твоей панели.\n\nДруг видит модели панели, но только свои чаты. Ключ скрыт, расход идёт с твоего API-баланса.'
-        if not panels:
-            body += '\n\nУ тебя пока нет своих панелей. Добавь их в главном меню → Панели.'
-        self.card(uid, f'🤝 Панели для {friend} · {page+1}/{pages}', body, keyboard(*rows))
+            granted = bool(self.store.one('SELECT 1 FROM panel_shares WHERE panel=? AND friend=?',(p['id'],friend)))
+            choices.append(btn(('✅ ' if granted else '➕ ')+self.compact_label(aliases[p['id']]),
+                               f'sharetoggle:{friend}:{p["id"]}:{page}','success' if granted else 'primary'))
+        rows = [choices[i:i+2] for i in range(0,len(choices),2)]
+        rows += self.page_nav(page,pages,f'shares:{friend}')
+        rows += [[btn('👤 Карточка друга',f'friend:{friend}'),btn('👥 Все друзья','friends')]]
+        body = '✅ Разрешена · ➕ Выдать. Нажми панель, чтобы включить или отключить доступ. Ключ скрыт, расходы идут с твоего API-баланса.'
+        if not self.store.has_subscription(friend):
+            body += '\n\nСначала выдай срок доступа в карточке друга.'
+        self.card(uid,f'🤝 Панели для {friend} · {page+1}/{pages}',body,keyboard(*rows))
 
     def invite(self, uid, days=None):
         if uid not in self.admins:
@@ -1931,7 +2048,7 @@ class AIChat:
                     return
                 if uid in self.jobs and action not in ('home', 'usage'):
                     raise ValueError('Дождись ответа или нажми «Стоп», прежде чем менять настройки.')
-                if action not in ('confirmrestore', 'confirmcleardb', 'confirmrevoke'):
+                if action not in ('confirmrestore', 'confirmcleardb', 'confirmrevoke', 'yespanel', 'yeschat'):
                     self.states.pop(uid, None)
                 if action == 'home':
                     self.home(uid)
@@ -1972,9 +2089,14 @@ class AIChat:
                         models = self.provider(panel).models()
                         self.card(uid, '✅ API доступен', f'Моделей: {len(models)}\nВремя: {now() - start:.2f} с\nПроверен /models. Поддержку фото и голоса нужно проверять выбранной моделью.')
                     elif action == 'delpanel':
+                        self.states[uid] = {'step':'delete_panel','panel':pid,'expires':now()+300}
                         self.card(uid, '🗑 Удалить панель?', panel['name'] + '\nБудут удалены ключ, все чаты панели и избранное.', keyboard(
                             [btn('Да, удалить', f'yespanel:{pid}', 'danger'), btn('Отмена', f'panelcfg:{pid}')]))
                     else:
+                        state = self.states.get(uid,{})
+                        if state.get('step')!='delete_panel' or state.get('panel')!=pid or state.get('expires',0)<now():
+                            raise ValueError('Подтверди удаление панели заново.')
+                        self.states.pop(uid,None)
                         with self.store.db() as c:
                             c.execute('DELETE FROM panels WHERE id=? AND owner=?', (pid, uid))
                             replacement = c.execute('SELECT id FROM panels WHERE owner=? ORDER BY id LIMIT 1', (uid,)).fetchone()
@@ -1991,6 +2113,21 @@ class AIChat:
                 elif action == 'searchmodel':
                     self.states[uid] = {'step': 'searchmodel'}
                     self.tell(uid, 'Напиши часть названия модели. «🏠 Меню» — отмена.')
+                elif action == 'choose':
+                    if len(parts)<3:
+                        raise ValueError('Модель не найдена.')
+                    self.select_model(uid,int(parts[1]),':'.join(parts[2:]))
+                elif action == 'favorite_current':
+                    chat = self.store.chat(uid)
+                    self.owned_chat(uid,chat['id'])
+                    if not chat['model']:
+                        raise ValueError('Сначала выбери модель.')
+                    existing = self.store.one('SELECT 1 FROM favorites WHERE owner=? AND panel=? AND model=?',(uid,chat['panel'],chat['model']))
+                    if existing:
+                        self.store.write('DELETE FROM favorites WHERE owner=? AND panel=? AND model=?',(uid,chat['panel'],chat['model']))
+                    else:
+                        self.store.write('INSERT INTO favorites VALUES(?,?,?)',(uid,chat['panel'],chat['model']))
+                    self.models(uid)
                 elif action in ('model', 'favorite'):
                     cache = self.cache.get(uid,{})
                     if len(parts)!=3 or parts[1]!=cache.get('revision') or cache.get('expires',0)<now():
@@ -2010,18 +2147,7 @@ class AIChat:
                             self.store.write('INSERT INTO favorites VALUES(?,?,?)',(uid,pid,model))
                         self.models(uid,query=cache.get('query',''),favorites=cache.get('favorites',False))
                     else:
-                        u = self.store.user(uid)
-                        old = self.store.one('SELECT * FROM chats WHERE id=? AND owner=?',(u['current_chat'],uid))
-                        if old and not self.store.panel(uid,old['panel']):
-                            old = None
-                        self.store.write('UPDATE users SET active=? WHERE id=?',(pid,uid))
-                        self.store.write('INSERT INTO panel_choices VALUES(?,?,?) ON CONFLICT(owner,panel) DO UPDATE SET model=excluded.model',(uid,pid,model))
-                        if old:
-                            self.store.write('UPDATE chats SET panel=?,model=?,updated=? WHERE id=? AND owner=?',(pid,model,now(),old['id'],uid))
-                        else:
-                            chat = self.store.new_chat(uid)
-                            self.store.write('UPDATE chats SET model=? WHERE id=?',(model,chat['id']))
-                        self.resume(uid)
+                        self.select_model(uid,pid,model)
                 elif action in ('chats', 'chatpage'):
                     self.chats(uid, int(parts[1]) if action == 'chatpage' else 0)
                 elif action in ('chat', 'chatcfg', 'renamechat', 'delchat', 'yeschat', 'history'):
@@ -2030,19 +2156,22 @@ class AIChat:
                     if action == 'chat':
                         self.store.write('UPDATE users SET active=?,current_chat=? WHERE id=?', (chat['panel'], cid, uid))
                         self.resume(uid)
-                        recent = self.store.history(cid, 4)
-                        if recent:
-                            self.tell(uid, 'Последние сообщения:\n\n' + '\n\n'.join(('Ты: ' if m['role'] == 'user' else 'ИИ: ') + (m['content'][:700] if isinstance(m['content'], str) else '[изображение]') for m in recent))
                     elif action == 'chatcfg':
                         self.card(uid, '💬 ' + chat['title'], chat['model'] or 'Модель не выбрана', keyboard(
-                            [btn('✏️ Название', f'renamechat:{cid}'), btn('📜 История TXT', f'history:{cid}')],
+                            [btn('💬 Открыть', f'chat:{cid}'),btn('📜 История', f'history:{cid}')],
+                            [btn('✏️ Название',f'renamechat:{cid}'),btn('🧠 Модели','models')],
                             [btn('🗑 Удалить', f'delchat:{cid}', 'danger'), btn('‹ Чаты', 'chats')]))
                     elif action == 'renamechat':
                         self.states[uid] = {'step': 'renamechat', 'chat': cid}
                         self.tell(uid, 'Новое название чата?')
                     elif action == 'delchat':
+                        self.states[uid] = {'step':'delete_chat','chat':cid,'expires':now()+300}
                         self.card(uid, 'Удалить чат?', chat['title'], keyboard([btn('Удалить', f'yeschat:{cid}', 'danger'), btn('Отмена', f'chatcfg:{cid}')]))
                     elif action == 'yeschat':
+                        state = self.states.get(uid,{})
+                        if state.get('step')!='delete_chat' or state.get('chat')!=cid or state.get('expires',0)<now():
+                            raise ValueError('Подтверди удаление чата заново.')
+                        self.states.pop(uid,None)
                         self.store.write('DELETE FROM chats WHERE owner=? AND id=?', (uid, cid))
                         self.store.write('UPDATE users SET current_chat=NULL WHERE id=? AND current_chat=?', (uid, cid))
                         self.chats(uid)
@@ -2195,6 +2324,8 @@ class AIChat:
                 elif action == 'confirmcleardb':
                     state = self.states.get(uid, {})
                     if uid not in self.admins or state.get('step') != 'clear_confirm' or state.get('expires', 0) < now():
+                        if state.get('step')=='clear_confirm' and state.get('expires',0)<now():
+                            self.states.pop(uid,None)
                         raise ValueError('Подтверждение очистки истекло. База не изменена.')
                     with self.lock:
                         if self.jobs:
@@ -2202,6 +2333,8 @@ class AIChat:
                         self.store.clear_database()
                         self.states.clear()
                         self.cache.clear()
+                        self.reply_routes.clear()
+                        self.reply_labels.clear()
                     self.tell(uid, 'База очищена. Создана зашифрованная копия в каталоге backups. /start — начать настройку заново.')
                 elif action == 'confirmrestore':
                     state = self.states.get(uid, {})
@@ -2213,6 +2346,8 @@ class AIChat:
                         self.store.restore(state['blob'])
                         self.states.clear()
                         self.cache.clear()
+                        self.reply_routes.clear()
+                        self.reply_labels.clear()
                     self.tell(uid, 'База восстановлена. /start — открыть чат.')
             except ValueError as error:
                 self.tell(uid, str(error))
@@ -2239,16 +2374,22 @@ class AIChat:
             self.menu_ids.pop(uid, None)
         text = message.text or ''
         if text.startswith('/'):
-            if text.split()[0].split('@')[0] != '/start':
+            if text.split()[0].split('@')[0] == '/start':
+                self.command(message)
+            else:
                 self.tell(uid,'Осталась только команда /start. Остальное — кнопками снизу.')
-                return
-        route = self.reply_routes.get(uid,{}).get(text) or {'🏠 Меню':'home','⏹ Стоп':'stop'}.get(text)
+            return
+        route = self.load_routes(uid).get(text) or {
+            '🏠 Меню':'home','⏹ Стоп':'stop','🧠 Модели':'models','💬 Чаты':'chats',
+            '✚ Новый чат':'newchat','⭐ Избранное':'models:favorites','⚙️ Настройки':'settings',
+            '🎟 Доступ':'subscription','🛠 Админка':'admin','📚 Панели':'panels'}.get(text)
         if route:
             call = type('LocalCall',(),{'id':'','from_user':message.from_user,'message':message,'data':route})()
             self.callback(call)
             return
-        if text in self.reply_labels or text.startswith(('🤖 ', '☆ ', '★ ', '✓ ')) or re.match(r'^\d+\. 🧠 ',text):
-            self.tell(uid,'Эта кнопка устарела. Нажми /start.')
+        if text in self.reply_labels.get(uid,set()) or re.match(r'^\d+\. 🧠 ',text) or re.match(r'^(?:🧠|✅) .+ · .+',text):
+            if self.gate(uid):
+                self.home(uid)
             return
         state = self.states.get(uid, {})
         step = state.get('step')
@@ -2383,8 +2524,13 @@ class AIChat:
             self.states.pop(uid, None)
             self.chats(uid)
         elif step == 'limits':
-            tokens, usd = text.replace(',', '.').split()
-            tokens, usd = int(tokens), float(usd)
+            try:
+                tokens, usd = text.replace(',', '.').split()
+                tokens, usd = int(tokens), float(usd)
+            except (ValueError,TypeError):
+                raise ValueError('Введи два числа: лимит токенов и USD. Например: 100000 2. Ноль отключает соответствующий лимит.') from None
+            if tokens > 9223372036854775807:
+                raise ValueError('Лимит токенов слишком большой. Для отключения ограничения укажи 0.')
             if tokens < 0 or usd < 0 or not math.isfinite(usd):
                 raise ValueError('Лимиты должны быть конечными неотрицательными числами.')
             self.store.write('UPDATE users SET daily_tokens=?,daily_usd=? WHERE id=?', (tokens, usd, uid))
